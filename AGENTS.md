@@ -10,19 +10,19 @@ uiautomator2 (JSON-RPC) capture, manual file loading, and save-as.
 ## Tech Stack
 
 - **Language**: Rust
-- **GUI**: eframe/egui 0.27
+- **GUI**: eframe/egui 0.35
 - **XML parsing**: roxmltree 0.19
 - **Image loading**: image 0.25 (png, jpeg)
 - **File dialogs**: rfd 0.14
 - **JSON**: serde_json 1.0
-- **ADB**: via `std::process::Command`
+- **ADB**: via `adb()` helper (`CREATE_NO_WINDOW` on Windows)
 - **Rendering**: glow backend (OpenGL)
 
 ## Project Layout
 
 ```
 /var/my_share/projects/uiviewer/
-├── src/main.rs      # single-file app (~1460 lines)
+├── src/main.rs      # single-file app (~1540 lines)
 ├── Cargo.toml
 ├── AGENTS.md
 └── README.md
@@ -37,6 +37,7 @@ uiautomator2 (JSON-RPC) capture, manual file loading, and save-as.
   - `node_at(path)` — follows `Vec<usize>` path to a node
 - **`App`** — egui app state with screenshot/texture, paths, expanded set, selection/hover state
 - **`CaptureMethod`** — `Adb` | `U2`
+- **`TempGuard`** — RAII temp file cleanup: tracks files during capture, removes on Drop/error, `disarm()` on success
 
 ### Key Functions
 
@@ -57,12 +58,13 @@ uiautomator2 (JSON-RPC) capture, manual file loading, and save-as.
 ### Layout Structure
 
 ```
-CentralPanel                              — Manual left/right split with draggable 4px divider
-  ├── left side                           — Screenshot image with hover/click/drag overlays
-  ├── divider (draggable)                 — Updates `properties_width` field
-  └── right side                          — Node Tree + Properties panels
-TopBottomPanel::top("toolbar")            — Load/ADB/U2/Save buttons + display selector + file names
-TopBottomPanel::bottom("status")          — Status messages
+CentralPanel                              — Screenshot image with hover/click/drag overlays
+Panel::right("properties_panel")          — Node Tree + Properties panels (resizable)
+  ├── display selector (tree_display_id)
+  ├── tree scroll area
+  └── properties scroll area
+Panel::top("toolbar")                     — Load/ADB/U2/Save buttons + display selector + file names
+Panel::bottom("status")                   — Status messages
 ```
 
 ### Tree Click Handling (critical pattern)
@@ -88,16 +90,16 @@ trigger auto-scroll-to-focused-widget behavior.
 ### Multi-Display Support
 
 - **Display detection**: `get_displays(serial)` returns `Vec<(u32, u64)>` pairing logical IDs (from `dumpsys display`) with physical IDs (from `dumpsys SurfaceFlinger --display-id`)
-- **Display selector**: ComboBox in toolbar (always when device connected) and Node Tree panel (when file loaded)
+- **Display selector**: ComboBox in toolbar (`display_id`, for capture/tap/swipe) and Node Tree panel (`tree_display_id`, for tree filtering only)
 - **ADB**: multi-display uses `screencap -d <phys_id>` + `uiautomator dump --windows`; single uses `screencap -p` + standard `uiautomator dump`
 - **U2**: screenshot via `/screenshot/{display_id}`; hierarchy via `/dump/hierarchy` (no display param, atx-agent may return all displays)
 - **File parsing**: `parse_windows_xml` handles `<hierarchy><displays><display>`, hybrid `<hierarchy><display>`, and `--windows` `<displays><display><window><hierarchy>` formats
-- **On display change**: for file-loaded data, re-parses XML from `file_xml_content` with new `display_id`; for device capture, re-captures with new display
+- **On display change**: for file-loaded data, re-parses XML from `file_xml_content` with `tree_display_id` (cached by `last_tree_display_id` to avoid per-frame re-parse); for device capture, re-captures with `display_id`
+- **After capture**: `tree_display_id` initialized to captured `display_id` so tree shows captured display
 
 ### Properties Panel
 
-- Manual split inside `CentralPanel` (not `SidePanel`) — prevents content width from influencing panel width
-- `properties_width: f32` field, draggable 4px divider, clamped 80..70% of panel
+- `Panel::right("properties_panel")` (resizable, min 80px) — replaces old manual divider drag inside CentralPanel
 - Labels on separate lines (key bold, value selectable+wrap)
 
 ### find_branch Behavior
@@ -109,6 +111,7 @@ trigger auto-scroll-to-focused-widget behavior.
 ### Theme
 
 - Forced light theme explicitly (`follow_system_theme: false`, `default_theme: Theme::Light`)
+    → Now via `cc.egui_ctx.set_theme(egui::Theme::Light)` (eframe 0.35)
 - Selection text: `Color32::from_rgb(0, 150, 0)` (dark green)
 - Hover text: `Color32::RED`
 - Image selection overlay: green stroke, hover overlay: red stroke
@@ -143,6 +146,10 @@ cargo run
 ```
 
 Device detection: `adb devices` → picks the first connected device. No hard-coded serial.
+
+## Requirements
+
+- Rust **1.92+** (MSRV — eframe 0.35 requires 1.92)
 
 ## Windows-Specific Considerations
 
