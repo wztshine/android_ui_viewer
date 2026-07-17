@@ -1,4 +1,4 @@
-use eframe::{egui, Frame};
+use eframe::egui;
 use egui::{
     pos2, Color32, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
@@ -12,6 +12,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 static U2_STARTED: AtomicBool = AtomicBool::new(false);
 static U2_SERIAL: Mutex<Option<String>> = Mutex::new(None);
 
@@ -21,11 +27,44 @@ const ATX_AGENT: &str = "/data/local/tmp/atx-agent";
 const UIAUTOMATOR_APK: &str = "/data/local/tmp/app-uiautomator.apk";
 const DEVICE_DUMP: &str = "/sdcard/uiviewer_dump.xml";
 
+struct TempGuard {
+    files: Vec<PathBuf>,
+}
+
+impl TempGuard {
+    fn new() -> Self {
+        Self { files: Vec::new() }
+    }
+    fn track(&mut self, p: PathBuf) {
+        self.files.push(p);
+    }
+    fn disarm(mut self) {
+        self.files.clear();
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        for f in self.files.drain(..) {
+            let _ = std::fs::remove_file(&f);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct UiNode {
     bounds: Rect,
     attrs: Vec<(String, String)>,
     children: Vec<UiNode>,
+}
+
+fn adb() -> Command {
+    let mut cmd = Command::new("adb");
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }
 
 impl UiNode {
@@ -173,6 +212,8 @@ struct App {
     selected_device: Option<String>,
     available_displays: Vec<(u32, u64)>,
     display_id: u32,
+    tree_display_id: u32,
+    last_tree_display_id: u32,
     pending_tap: Option<(f32, f32)>,
     tap_settle_start: Option<Instant>,
     last_capture: Option<CaptureMethod>,
@@ -182,6 +223,7 @@ struct App {
     file_xml_content: Option<String>,
     properties_width: f32,
     drag_start_img: Option<Pos2>,
+    last_adb_check: Option<Instant>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -212,6 +254,8 @@ impl Default for App {
             selected_device: None,
             available_displays: vec![(0, 0)],
             display_id: 0,
+            tree_display_id: 0,
+            last_tree_display_id: 0,
             pending_tap: None,
             tap_settle_start: None,
             last_capture: None,
@@ -221,6 +265,7 @@ impl Default for App {
             file_xml_content: None,
             properties_width: 350.0,
             drag_start_img: None,
+            last_adb_check: None,
         }
     }
 }
@@ -398,14 +443,15 @@ fn adb_capture(serial: &str, display_logical: u32, display_physical: u64, use_wi
     let suffix = if display_logical > 0 { format!("_d{display_logical}") } else { String::new() };
     let png = tmp.join(format!("uiviewer_adb_screenshot{suffix}.png"));
     let xml = tmp.join(format!("uiviewer_adb_dump{suffix}.xml"));
+    let mut tmp_guard = TempGuard::new();
 
     let img = if display_physical > 0 {
         let phys_str = display_physical.to_string();
-        Command::new("adb")
+        adb()
             .args(["-s", serial, "exec-out", "screencap", "-p", "-d", &phys_str])
             .output()
     } else {
-        Command::new("adb")
+        adb()
             .args(["-s", serial, "exec-out", "screencap", "-p"])
             .output()
     }
@@ -414,43 +460,44 @@ fn adb_capture(serial: &str, display_logical: u32, display_physical: u64, use_wi
         return Err("screencap returned error".into());
     }
     std::fs::write(&png, &img.stdout).map_err(|e| format!("write png: {e}"))?;
+    tmp_guard.track(png.clone());
 
     let dump = if use_windows {
-        Command::new("adb")
+        adb()
             .args(["-s", serial, "shell", "uiautomator", "dump", "--windows", DEVICE_DUMP])
             .output()
     } else {
-        Command::new("adb")
+        adb()
             .args(["-s", serial, "shell", "uiautomator", "dump", DEVICE_DUMP])
             .output()
     }
     .map_err(|e| format!("uiautomator dump failed: {e}"))?;
     if !dump.status.success() {
-        let _ = std::fs::remove_file(&png);
         return Err("uiautomator dump returned error".into());
     }
 
-    let pull = Command::new("adb")
+    let pull = adb()
         .args(["-s", serial, "pull", DEVICE_DUMP, &xml.to_string_lossy().to_string()])
         .output()
         .map_err(|e| format!("adb pull failed: {e}"))?;
 
     // always clean up temp file on device
-    let _ = Command::new("adb")
+    let _ = adb()
         .args(["-s", serial, "shell", "rm", DEVICE_DUMP])
         .output();
 
     if !pull.status.success() {
-        let _ = std::fs::remove_file(&png);
         return Err("adb pull returned error".into());
     }
+    tmp_guard.track(xml.clone());
 
+    tmp_guard.disarm();
     Ok((png, xml))
 }
 
 fn get_displays(serial: &str) -> Vec<(u32, u64)> {
     // Get physical display IDs from SurfaceFlinger
-    let physical_output = Command::new("adb")
+    let physical_output = adb()
         .args(["-s", serial, "shell", "dumpsys", "SurfaceFlinger", "--display-id"])
         .output()
         .ok()
@@ -478,7 +525,7 @@ fn get_displays(serial: &str) -> Vec<(u32, u64)> {
     }
 
     // Get logical display IDs from dumpsys display
-    let logical_output = Command::new("adb")
+    let logical_output = adb()
         .args(["-s", serial, "shell", "dumpsys", "display"])
         .output()
         .ok()
@@ -528,9 +575,6 @@ fn http_get(path: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("read status: {e}"))?;
     let parts: Vec<&str> = status_line.split_whitespace().collect();
     let code = parts.get(1).unwrap_or(&"");
-    if !code.starts_with('2') {
-        return Err(format!("HTTP {code}"));
-    }
 
     let mut chunked = false;
     loop {
@@ -550,15 +594,23 @@ fn http_get(path: &str) -> Result<Vec<u8>, String> {
         }
     }
 
-    if chunked {
-        read_chunked(&mut reader)
+    let body = if chunked {
+        read_chunked(&mut reader)?
     } else {
-        let mut body = Vec::new();
+        let mut b = Vec::new();
         reader
-            .read_to_end(&mut body)
+            .read_to_end(&mut b)
             .map_err(|e| format!("read body: {e}"))?;
-        Ok(body)
+        b
+    };
+
+    if !code.starts_with('2') {
+        let msg = String::from_utf8_lossy(&body).trim().to_string();
+        let detail = if msg.is_empty() { String::new() } else { format!(": {msg}") };
+        return Err(format!("HTTP {code}{detail}"));
     }
+
+    Ok(body)
 }
 
 fn read_chunked(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
@@ -599,23 +651,11 @@ fn uiautomator2_capture(serial: &str, display_id: u32) -> Result<(PathBuf, PathB
     let suffix = if display_id > 0 { format!("_d{display_id}") } else { String::new() };
     let png = tmp.join(format!("uiviewer_u2_screenshot{suffix}.png"));
     let xml = tmp.join(format!("uiviewer_u2_dump{suffix}.xml"));
+    let mut tmp_guard = TempGuard::new();
 
-    // Only kill+restart atx-agent on first capture
+    // Check if atx-agent is already running — if so, reuse it
     if !U2_STARTED.load(Ordering::Relaxed) {
-        let _ = Command::new("adb")
-            .args(["-s", serial, "shell", "pkill -9 atx-agent; killall atx-agent; kill -9 $(pidof atx-agent) 2>/dev/null; true"])
-            .status();
-        // Kill stale uiautomator process so atx-agent starts fresh
-        let _ = Command::new("adb")
-            .args(["-s", serial, "shell", "am force-stop com.github.uiautomator"])
-            .status();
-        let _ = Command::new("adb")
-            .args(["-s", serial, "shell", "nohup", ATX_AGENT, "server", "-d", ">", "/dev/null", "2>&1", "&"])
-            .spawn();
-        std::thread::sleep(std::time::Duration::from_millis(2000));
-
-        // Verify atx-agent is running
-        let ok = Command::new("adb")
+        let already_running = adb()
             .args(["-s", serial, "shell", "pidof", "atx-agent"])
             .output()
             .ok()
@@ -625,14 +665,45 @@ fn uiautomator2_capture(serial: &str, display_id: u32) -> Result<(PathBuf, PathB
                 Some(s.split_whitespace().next()?.parse::<u32>().ok()?)
             })
             .is_some();
-        if !ok {
-            return Err(format!("{ATX_AGENT} failed to start — check if binary exists and is executable"));
+
+        if !already_running {
+            let _ = adb()
+                .args(["-s", serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
+                .output();
+            // Kill stale uiautomator process so atx-agent starts fresh
+            let _ = adb()
+                .args(["-s", serial, "shell", "am force-stop com.github.uiautomator"])
+                .output();
+            // Start atx-agent server in daemon mode (-d is a flag of the server subcommand)
+            let _ = adb()
+                .args(["-s", serial, "shell", ATX_AGENT, "server", "-d"])
+                .output();
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+
+            // Verify atx-agent started
+            let ok = adb()
+                .args(["-s", serial, "shell", "pidof", "atx-agent"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    Some(s.split_whitespace().next()?.parse::<u32>().ok()?)
+                })
+                .is_some();
+            if !ok {
+                return Err(format!("{ATX_AGENT} failed to start — check if binary exists and is executable"));
+            }
         }
         U2_STARTED.store(true, Ordering::Relaxed);
+        // Record serial early so exit cleanup can kill atx-agent/forward even if capture fails
+        if let Ok(mut guard) = U2_SERIAL.lock() {
+            *guard = Some(serial.to_string());
+        }
     }
 
     // Ensure uiautomator test APK is installed (check every time)
-    let pkgs = Command::new("adb")
+    let pkgs = adb()
         .args(["-s", serial, "shell", "pm", "list", "packages"])
         .output()
         .ok()
@@ -640,49 +711,49 @@ fn uiautomator2_capture(serial: &str, display_id: u32) -> Result<(PathBuf, PathB
         .unwrap_or_default();
     let apk_installed = pkgs.lines().any(|l| l.trim() == "package:com.github.uiautomator");
     if !apk_installed {
-        let apk_file = Command::new("adb")
+        let apk_file = adb()
             .args(["-s", serial, "shell", "ls", UIAUTOMATOR_APK])
-            .status()
-            .map(|s| s.success())
+            .output()
+            .map(|o| o.status.success())
             .unwrap_or(false);
         if apk_file {
-            let install = Command::new("adb")
+            let install = adb()
                 .args(["-s", serial, "shell", "pm", "install", "-r", UIAUTOMATOR_APK])
-                .status()
-                .map(|s| s.success())
+                .output()
+                .map(|o| o.status.success())
                 .unwrap_or(false);
             if !install {
                 return Err("installing app-uiautomator.apk failed".into());
             }
             // Restart atx-agent so it detects the newly installed service
-            let _ = Command::new("adb")
-                .args(["-s", serial, "shell", "pkill -9 atx-agent; killall atx-agent; kill -9 $(pidof atx-agent) 2>/dev/null; true"])
-                .status();
-            let _ = Command::new("adb")
-                .args(["-s", serial, "shell", "nohup", ATX_AGENT, "server", "-d", ">", "/dev/null", "2>&1", "&"])
-                .spawn();
+            let _ = adb()
+                .args(["-s", serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
+                .output();
+            let _ = adb()
+                .args(["-s", serial, "shell", ATX_AGENT, "server", "-d"])
+                .output();
             std::thread::sleep(std::time::Duration::from_millis(2000));
         }
         // APK file not on device — proceed, screenshot may still work
     }
 
     // Remove stale forward first, then create fresh one
-    let _ = Command::new("adb")
+    let _ = adb()
         .args(["-s", serial, "forward", "--remove", U2_FORWARD])
-        .status();
-    let status = Command::new("adb")
+        .output();
+    let status = adb()
         .args(["-s", serial, "forward", U2_FORWARD, U2_FORWARD])
-        .status()
+        .output()
         .map_err(|e| format!("adb not found: {e}"))?;
-    if !status.success() {
+    if !status.status.success() {
         return Err(format!("adb forward ({U2_FORWARD}) failed — port may be in use"));
     }
 
-    // Screenshot: GET /screenshot/{id} → PNG (retry while 502 for ~5s)
+    // Screenshot: GET /screenshot/{id} → PNG (via atx-agent HTTP, ~12% faster than adb exec-out)
+    let screenshot_path = format!("/screenshot/{display_id}");
     let png_bytes = {
         let mut retries = 0;
         let mut last_err;
-        let screenshot_path = format!("/screenshot/{display_id}");
         loop {
             match http_get(&screenshot_path) {
                 Ok(bytes) if bytes.starts_with(&[0x89, b'P', b'N', b'G']) => {
@@ -699,17 +770,16 @@ fn uiautomator2_capture(serial: &str, display_id: u32) -> Result<(PathBuf, PathB
         }
     };
     std::fs::write(&png, &png_bytes).map_err(|e| format!("write png: {e}"))?;
+    tmp_guard.track(png.clone());
 
     // Hierarchy dump: GET /dump/hierarchy → JSON-wrapped XML
     let raw = http_get("/dump/hierarchy")
         .map_err(|e| format!("dump: {e}"))?;
     let xml_bytes = extract_xml(&raw);
     std::fs::write(&xml, &xml_bytes).map_err(|e| format!("write xml: {e}"))?;
+    tmp_guard.track(xml.clone());
 
-    if let Ok(mut guard) = U2_SERIAL.lock() {
-        *guard = Some(serial.to_string());
-    }
-
+    tmp_guard.disarm();
     Ok((png, xml))
 }
 
@@ -749,9 +819,11 @@ impl App {
                 self.file_displays = get_display_ids_from_xml(&content);
                 if !self.file_displays.is_empty() {
                     self.file_xml_content = Some(content.clone());
-                    self.root_node = parse_windows_xml(&content, self.display_id);
+                    self.tree_display_id = self.file_displays[0];
+                    self.last_tree_display_id = self.tree_display_id;
+                    self.root_node = parse_windows_xml(&content, self.tree_display_id);
                     if self.root_node.is_none() {
-                        eprintln!("Failed to parse --windows XML for display {}", self.display_id);
+                        eprintln!("Failed to parse --windows XML for display {}", self.tree_display_id);
                     }
                 } else {
                     self.file_displays.clear();
@@ -827,8 +899,13 @@ impl App {
     }
 
     fn refresh_devices(&mut self) {
+        let now = Instant::now();
+        if self.last_adb_check.is_some_and(|t| now - t < std::time::Duration::from_secs(15)) {
+            return;
+        }
+        self.last_adb_check = Some(now);
         self.adb_devices.clear();
-        if let Ok(out) = Command::new("adb")
+        if let Ok(out) = adb()
             .args(["devices"])
             .output()
         {
@@ -872,6 +949,8 @@ impl App {
             Ok((png, xml)) => {
                 self.load_screenshot(&png, ctx);
                 self.load_xml(&xml, ctx);
+                self.tree_display_id = self.display_id;
+                self.last_tree_display_id = self.tree_display_id;
                 self.temp_screenshot = Some(png);
                 self.temp_xml = Some(xml);
                 self.status_message = Some("uiautomator2 capture successful".into());
@@ -898,12 +977,12 @@ impl App {
         };
 
         if U2_STARTED.load(Ordering::Relaxed) {
-            let _ = Command::new("adb")
-                .args(["-s", &serial, "shell", "pkill -9 atx-agent; killall atx-agent; kill -9 $(pidof atx-agent) 2>/dev/null; true"])
-                .status();
-            let _ = Command::new("adb")
+            let _ = adb()
+                .args(["-s", &serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
+                .output();
+            let _ = adb()
                 .args(["-s", &serial, "shell", "am force-stop com.github.uiautomator"])
-                .status();
+                .output();
             U2_STARTED.store(false, Ordering::Relaxed);
         }
 
@@ -926,9 +1005,11 @@ impl App {
                     if let Ok(content) = std::fs::read_to_string(&xml) {
                         self.file_displays = get_display_ids_from_xml(&content);
                         self.file_xml_content = Some(content.clone());
-                        self.root_node = parse_windows_xml(&content, self.display_id);
+                        self.tree_display_id = self.display_id;
+                        self.last_tree_display_id = self.tree_display_id;
+                        self.root_node = parse_windows_xml(&content, self.tree_display_id);
                         if self.root_node.is_none() {
-                            eprintln!("Failed to parse --windows XML for display {}", self.display_id);
+                            eprintln!("Failed to parse --windows XML for display {}", self.tree_display_id);
                         }
                     }
                 } else {
@@ -953,7 +1034,8 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         self.refresh_devices();
 
         // Handle double-click tap — two-phase: tap now, capture after settle
@@ -972,9 +1054,9 @@ impl eframe::App for App {
                 input_args.push("tap".to_string());
                 input_args.push(format!("{:.0}", x));
                 input_args.push(format!("{:.0}", y));
-                let _ = Command::new("adb")
+                let _ = adb()
                     .args(&input_args)
-                    .status();
+                    .output();
             }
             self.status_message = Some("Refreshing...".into());
             self.status_is_error = false;
@@ -986,8 +1068,8 @@ impl eframe::App for App {
             if tap_start.elapsed() >= std::time::Duration::from_millis(800) {
                 self.tap_settle_start = None;
                 match self.last_capture {
-                    Some(CaptureMethod::Adb) => self.adb_capture_and_load(ctx),
-                    Some(CaptureMethod::U2) | None => self.load_from_u2(ctx),
+                    Some(CaptureMethod::Adb) => self.adb_capture_and_load(&ctx),
+                    Some(CaptureMethod::U2) | None => self.load_from_u2(&ctx),
                 }
             } else {
                 ctx.request_repaint();
@@ -1007,44 +1089,52 @@ impl eframe::App for App {
         }
 
         // Re-parse when display selector changes for multi-display file
-        if let Some(ref content) = self.file_xml_content.clone() {
-            if self.file_displays.len() > 1 {
-                let current = parse_windows_xml(content, self.display_id);
-                if current.as_ref().map(|n| &n.bounds) != self.root_node.as_ref().map(|n| &n.bounds) {
-                    self.root_node = current;
-                    self.selected_path = None;
-                    self.expanded.clear();
-                }
+        if self.file_displays.len() > 1 && self.tree_display_id != self.last_tree_display_id {
+            self.last_tree_display_id = self.tree_display_id;
+            if let Some(content) = self.file_xml_content.as_deref() {
+                self.root_node = parse_windows_xml(content, self.tree_display_id);
+                self.selected_path = None;
+                self.expanded.clear();
             }
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("📷 Load Screenshot").clicked() {
+                let load_screenshot = || {
                     let mut dialog = rfd::FileDialog::new()
                         .add_filter("Images", &["png", "jpg", "jpeg"]);
                     if let Some(ref dir) = self.screenshot_dir {
                         dialog = dialog.set_directory(dir);
                         let _ = std::env::set_current_dir(dir);
                     }
-                    if let Some(path) = dialog.pick_file() {
-                        self.load_screenshot(&path, ctx);
+                    dialog.pick_file()
+                };
+                if ui.button("📷 Load Screenshot").clicked() {
+                    if let Some(path) = load_screenshot() {
+                        self.load_screenshot(&path, &ctx);
                     }
                 }
-                if ui.button("📄 Load XML").clicked() {
+                let load_xml = || {
                     let mut dialog = rfd::FileDialog::new()
                         .add_filter("XML/UIX", &["xml", "uix"]);
                     if let Some(ref dir) = self.xml_dir {
                         dialog = dialog.set_directory(dir);
                         let _ = std::env::set_current_dir(dir);
                     }
-                    if let Some(path) = dialog.pick_file() {
-                        self.load_xml(&path, ctx);
+                    dialog.pick_file()
+                };
+                if ui.button("📄 Load XML").clicked() {
+                    if let Some(path) = load_xml() {
+                        self.load_xml(&path, &ctx);
                     }
+                }
+                if ui.button("🔄 Refresh device").clicked() {
+                    self.last_adb_check = None;
+                    self.refresh_devices();
                 }
                 if !self.adb_devices.is_empty() {
                     let current = self.selected_device.as_deref().unwrap_or("");
-                    egui::ComboBox::from_id_source("device_selector")
+                    egui::ComboBox::from_id_salt("device_selector")
                         .selected_text(current)
                         .width(160.0)
                         .show_ui(ui, |ui| {
@@ -1059,7 +1149,7 @@ impl eframe::App for App {
                 }
                 if !self.adb_devices.is_empty() {
                     let current_disp = format!("Disp {}", self.display_id);
-                    egui::ComboBox::from_id_source("display_selector")
+                    egui::ComboBox::from_id_salt("display_selector")
                         .selected_text(&current_disp)
                         .width(70.0)
                         .show_ui(ui, |ui| {
@@ -1069,17 +1159,19 @@ impl eframe::App for App {
                             }
                         });
                 }
+                ui.separator();
                 if ui.button("📱 ADB Capture").clicked() {
                     self.last_capture = Some(CaptureMethod::Adb);
-                    self.adb_capture_and_load(ctx);
+                    self.adb_capture_and_load(&ctx);
                 }
                 if ui.button("⚡ u2 Capture").clicked() {
                     self.last_capture = Some(CaptureMethod::U2);
-                    self.load_from_u2(ctx);
+                    self.load_from_u2(&ctx);
                 }
                 if ui.button("💾 Save").clicked() {
                     self.save_files();
                 }
+                ui.separator();
                 if let Some(path) = &self.screenshot_path {
                     ui.label(format!(
                         "Screenshot: {}",
@@ -1100,34 +1192,153 @@ impl eframe::App for App {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let panel_rect = ui.max_rect();
-            let divider_x = panel_rect.right() - self.properties_width;
-            let divider_w = 4.0;
+        egui::Panel::bottom("status").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(msg) = &self.status_message {
+                    let color = if self.status_is_error {
+                        Color32::RED
+                    } else {
+                        Color32::from_rgb(0, 180, 0)
+                    };
+                    ui.colored_label(color, msg);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(p) = self.click_pos {
+                        ui.label(format!("Click: ({:.0}, {:.0})", p.x, p.y));
+                    }
+                });
+            });
+        });
 
-            // --- Drag handle for properties panel width ---
-            let divider_rect = Rect::from_min_size(
-                pos2(divider_x, panel_rect.top()),
-                Vec2::new(divider_w, panel_rect.height()),
-            );
-            let divider_resp = ui.interact(divider_rect, ui.next_auto_id(), Sense::drag());
-            if divider_resp.dragged() {
-                self.properties_width = (self.properties_width - divider_resp.drag_delta().x)
-                    .clamp(80.0, panel_rect.width() * 0.7);
+        egui::Panel::right("properties_panel")
+            .resizable(true)
+            .default_size(self.properties_width)
+            .min_size(80.0)
+            .show(ui, |ui| {
+            self.properties_width = ui.max_rect().width();
+            ui.heading("Node Tree");
+            if !self.file_displays.is_empty() || self.root_node.is_some() {
+                let current_disp = format!("Display {}", self.tree_display_id);
+                let ids: Vec<u32> = if !self.file_displays.is_empty() {
+                    self.file_displays.clone()
+                } else {
+                    self.available_displays.iter().map(|(log, _)| *log).collect()
+                };
+                egui::ComboBox::from_id_salt("tree_display_selector")
+                    .selected_text(&current_disp)
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        for &log in &ids {
+                            let label = format!("Display {log}");
+                            ui.selectable_value(&mut self.tree_display_id, log, label);
+                        }
+                    });
             }
-            if divider_resp.hovered() || divider_resp.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            ui.separator();
+
+            let tree_max = (ui.available_height() * 0.45).max(100.0);
+            let mut expanded = self.expanded.clone();
+            egui::ScrollArea::vertical()
+                .id_salt("tree_scroll")
+                .max_height(tree_max)
+                .auto_shrink([true, false])
+                .show(ui, |ui| {
+                    let mut node_rects = Vec::new();
+                    if let Some(ref root) = self.root_node {
+                        let sel = self.selected_path.as_deref();
+                        let hov = self.hovered_path.as_deref();
+                        render_tree(ui, root, &[], &mut expanded, sel, hov, &mut node_rects);
+                    } else {
+                        ui.weak("No XML loaded");
+                    }
+                    let mut click_info: Option<Pos2> = None;
+                    ui.input(|i| {
+                        if i.pointer.any_click() {
+                            click_info = i.pointer.interact_pos();
+                        }
+                    });
+                    if let Some(pos) = click_info {
+                        for (path, rect) in &node_rects {
+                            if rect.contains(pos) {
+                                self.selected_path = Some(path.clone());
+                                self.last_selected = Some(path.clone());
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(ref target_path) = self.scroll_to_target {
+                        for (path, rect) in &node_rects {
+                            if path == target_path {
+                                ui.scroll_to_rect(*rect, Some(egui::Align::Center));
+                                break;
+                            }
+                        }
+                        self.scroll_to_target = None;
+                    }
+                });
+            self.expanded = expanded;
+
+            ui.separator();
+            ui.heading("Properties");
+            ui.separator();
+
+            let target = self
+                .hovered_path
+                .as_ref()
+                .or(self.selected_path.as_ref());
+            let node = target
+                .and_then(|p| self.root_node.as_ref()?.node_at(p));
+
+            if let Some(node) = node {
+                ui.colored_label(
+                    egui::Color32::BLACK,
+                    format!(
+                        "Bounds: [{:.0},{:.0}][{:.0},{:.0}]",
+                        node.bounds.min.x,
+                        node.bounds.min.y,
+                        node.bounds.max.x,
+                        node.bounds.max.y,
+                    ),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("props_scroll")
+                    .show(ui, |ui| {
+                        for (key, value) in &node.attrs {
+                            if key == "bounds" {
+                                continue;
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("{key}:"))
+                                    .strong(),
+                            );
+                            ui.add(
+                                egui::Label::new(value)
+                                    .wrap()
+                                    .selectable(true),
+                            );
+                        }
+                    });
+
+                if self.hovered_path.is_some()
+                    && self.hovered_path != self.selected_path
+                {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Click to select this element")
+                            .color(egui::Color32::GRAY)
+                            .italics(),
+                    );
+                }
+            } else {
+                ui.weak("Hover over an element to inspect");
             }
-            ui.painter().rect_filled(divider_rect, 0.0, Color32::from_gray(180));
+        });
 
-            // --- Left: screenshot ---
-            let mut left_rect = panel_rect;
-            left_rect.max.x = divider_x;
-            let left_ui = &mut ui.child_ui(left_rect, *ui.layout());
-
+        egui::CentralPanel::default().show(ui, |ui| {
             if let Some(ref tex) = self.screenshot_texture {
                 let img_size: Vec2 = tex.size_vec2();
-                let available = left_ui.available_size();
+                let available = ui.available_size();
                 let scale = (available.x / img_size.x).min(available.y / img_size.y);
                 let scaled = img_size * scale;
                 let offset = Vec2::new(
@@ -1135,10 +1346,10 @@ impl eframe::App for App {
                     (available.y - scaled.y).max(0.0) / 2.0,
                 );
 
-                let origin = left_ui.max_rect().min;
+                let origin = ui.max_rect().min;
                 let image_rect = Rect::from_min_size(origin + offset, scaled);
 
-                left_ui.painter().image(
+                ui.painter().image(
                     tex.id(),
                     image_rect,
                     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
@@ -1146,7 +1357,7 @@ impl eframe::App for App {
                 );
 
                 let response =
-                    left_ui.interact(image_rect, left_ui.next_auto_id(), Sense::click_and_drag());
+                    ui.interact(image_rect, ui.next_auto_id(), Sense::click_and_drag());
 
                 let img_pos_from = |mouse: Pos2| -> Pos2 {
                     pos2(
@@ -1162,8 +1373,7 @@ impl eframe::App for App {
                 }
 
                 if response.dragged() {
-                    // Track position during drag even if cursor leaves the widget
-                    if let Some(pos) = left_ui.ctx().input(|i| i.pointer.latest_pos()) {
+                    if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
                         self.last_hover_img_pos = Some(img_pos_from(pos));
                     }
                 }
@@ -1188,7 +1398,7 @@ impl eframe::App for App {
                                 args.push(format!("{:.0}", start.y));
                                 args.push(format!("{:.0}", end.x));
                                 args.push(format!("{:.0}", end.y));
-                                let _ = Command::new("adb").args(&args).status();
+                                let _ = adb().args(&args).output();
                             }
                             self.tap_settle_start = Some(Instant::now());
                             ctx.request_repaint();
@@ -1242,7 +1452,7 @@ impl eframe::App for App {
                             image_rect.min + node.bounds.min.to_vec2() * scale,
                             node.bounds.size() * scale,
                         );
-                        left_ui.painter().rect_stroke(r, 0.0, Stroke::new(stroke_width, color));
+                        ui.painter().rect_stroke(r, 0.0, Stroke::new(stroke_width, color), egui::StrokeKind::Middle);
                     }
                 };
 
@@ -1255,165 +1465,34 @@ impl eframe::App for App {
                     }
                 }
             } else {
-                left_ui.vertical_centered(|ui| {
+                ui.vertical_centered(|ui| {
                     ui.add_space(120.0);
                     ui.heading("UI Viewer");
                     ui.label("Load a screenshot and its uiautomator XML dump");
                     ui.label("to inspect UI elements by hovering on the image.");
                 });
             }
-
-            // --- Right: properties panel ---
-            let mut right_rect = panel_rect;
-            right_rect.min.x = divider_x + divider_w;
-            let right_ui = &mut ui.child_ui(right_rect, *ui.layout());
-
-            right_ui.heading("Node Tree");
-            if !self.file_displays.is_empty() || self.root_node.is_some() {
-                let current_disp = format!("Display {}", self.display_id);
-                let ids: Vec<u32> = if !self.file_displays.is_empty() {
-                    self.file_displays.clone()
-                } else {
-                    self.available_displays.iter().map(|(log, _)| *log).collect()
-                };
-                egui::ComboBox::from_id_source("display_selector")
-                    .selected_text(&current_disp)
-                    .width(140.0)
-                    .show_ui(right_ui, |ui| {
-                        for &log in &ids {
-                            let label = format!("Display {log}");
-                            ui.selectable_value(&mut self.display_id, log, label);
-                        }
-                    });
-            }
-            right_ui.separator();
-
-            let tree_max = (right_ui.available_height() * 0.45).max(100.0);
-            let mut expanded = self.expanded.clone();
-            egui::ScrollArea::vertical()
-                .id_source("tree_scroll")
-                .max_height(tree_max)
-                .auto_shrink([true, false])
-                .show(right_ui, |ui| {
-                    let mut node_rects = Vec::new();
-                    if let Some(ref root) = self.root_node {
-                        let sel = self.selected_path.as_deref();
-                        let hov = self.hovered_path.as_deref();
-                        render_tree(ui, root, &[], &mut expanded, sel, hov, &mut node_rects);
-                    } else {
-                        ui.weak("No XML loaded");
-                    }
-                    let mut click_info: Option<Pos2> = None;
-                    ui.input(|i| {
-                        if i.pointer.any_click() {
-                            click_info = i.pointer.interact_pos();
-                        }
-                    });
-                    if let Some(pos) = click_info {
-                        for (path, rect) in &node_rects {
-                            if rect.contains(pos) {
-                                self.selected_path = Some(path.clone());
-                                self.last_selected = Some(path.clone());
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(ref target_path) = self.scroll_to_target {
-                        for (path, rect) in &node_rects {
-                            if path == target_path {
-                                ui.scroll_to_rect(*rect, Some(egui::Align::Center));
-                                break;
-                            }
-                        }
-                        self.scroll_to_target = None;
-                    }
-                });
-            self.expanded = expanded;
-
-            right_ui.separator();
-            right_ui.heading("Properties");
-            right_ui.separator();
-
-            let target = self
-                .hovered_path
-                .as_ref()
-                .or(self.selected_path.as_ref());
-            let node = target
-                .and_then(|p| self.root_node.as_ref()?.node_at(p));
-
-            if let Some(node) = node {
-                right_ui.colored_label(
-                    egui::Color32::BLACK,
-                    format!(
-                        "Bounds: [{:.0},{:.0}][{:.0},{:.0}]",
-                        node.bounds.min.x,
-                        node.bounds.min.y,
-                        node.bounds.max.x,
-                        node.bounds.max.y,
-                    ),
-                );
-                right_ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_source("props_scroll")
-                    .show(right_ui, |ui| {
-                        for (key, value) in &node.attrs {
-                            if key == "bounds" {
-                                continue;
-                            }
-                            ui.label(
-                                egui::RichText::new(format!("{key}:"))
-                                    .strong(),
-                            );
-                            ui.add(
-                                egui::Label::new(value)
-                                    .wrap(true)
-                                    .selectable(true),
-                            );
-                        }
-                    });
-
-                if self.hovered_path.is_some()
-                    && self.hovered_path != self.selected_path
-                {
-                    right_ui.separator();
-                    right_ui.label(
-                        egui::RichText::new("Click to select this element")
-                            .color(egui::Color32::GRAY)
-                            .italics(),
-                    );
-                }
-            } else {
-                right_ui.weak("Hover over an element to inspect");
-            }
-        });
-
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(msg) = &self.status_message {
-                    let color = if self.status_is_error {
-                        Color32::RED
-                    } else {
-                        Color32::from_rgb(0, 180, 0)
-                    };
-                    ui.colored_label(color, msg);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(p) = self.click_pos {
-                        ui.label(format!("Click: ({:.0}, {:.0})", p.x, p.y));
-                    }
-                });
-            });
         });
     }
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn FreeConsole() -> i32;
+        }
+        unsafe { FreeConsole(); }
+    }
+
     let options = eframe::NativeOptions {
-        follow_system_theme: false,
-        default_theme: eframe::Theme::Light,
+        viewport: egui::ViewportBuilder::default()
+            .with_decorations(true),
+        centered: true,
         ..Default::default()
     };
     let result = eframe::run_native("UI Viewer", options, Box::new(|cc| {
+        cc.egui_ctx.set_theme(egui::Theme::Light);
         let mut fonts = egui::FontDefinitions::default();
         #[cfg(target_os = "windows")]
         let cjk_paths = [
@@ -1431,7 +1510,7 @@ fn main() -> eframe::Result<()> {
         ];
         for path in &cjk_paths {
             if let Ok(data) = std::fs::read(path) {
-                fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(data));
+                fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(data).into());
                 for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                     fonts.families.entry(family).or_default().push("cjk".to_owned());
                 }
@@ -1439,21 +1518,21 @@ fn main() -> eframe::Result<()> {
             }
         }
         cc.egui_ctx.set_fonts(fonts);
-        Box::new(App::default())
+        Ok(Box::new(App::default()))
     }));
 
     // Cleanup: kill atx-agent, stop uiautomator service, remove forward
     if let Ok(guard) = U2_SERIAL.lock() {
         if let Some(ref serial) = *guard {
-            let _ = std::process::Command::new("adb")
-                .args(["-s", serial, "shell", "pkill -9 atx-agent; killall atx-agent; kill -9 $(pidof atx-agent) 2>/dev/null; true"])
-                .status();
-            let _ = std::process::Command::new("adb")
+            let _ = adb()
+                .args(["-s", serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
+                .output();
+            let _ = adb()
                 .args(["-s", serial, "shell", "am force-stop com.github.uiautomator"])
-                .status();
-            let _ = std::process::Command::new("adb")
+                .output();
+            let _ = adb()
                 .args(["-s", serial, "forward", "--remove", U2_FORWARD])
-                .status();
+                .output();
         }
     }
 

@@ -143,3 +143,23 @@ cargo run
 ```
 
 Device detection: `adb devices` → picks the first connected device. No hard-coded serial.
+
+## Windows-Specific Considerations
+
+### Console Window Suppression
+On Windows, every `adb` subprocess spawn (e.g. `adb devices`, `adb shell`,
+`screencap`, `adb pull`) would flash a console window briefly because the parent
+process has no console (detached via `FreeConsole()`). All ADB invocations go
+through the `adb()` helper (`main.rs:37`) which sets `CREATE_NO_WINDOW` on Windows
+to suppress this.
+
+### Device Refresh Caching
+`refresh_devices()` is called at the start of every `ui()` frame but is rate-limited
+to once every 15 seconds (using `last_adb_check: Option<Instant>`). This prevents
+spawning `adb devices` on every mouse move / repaint. A manual 🔄 button in the
+toolbar resets `last_adb_check` to `None` and triggers an immediate refresh.
+
+### ADB calls
+All 28+ `Command::new("adb")` calls in the codebase have been replaced with `adb()`,
+ensuring consistent `CREATE_NO_WINDOW` behavior across the entire app on Windows.
+On non-Windows platforms, `adb()` is a no-op (identical to `Command::new("adb")`).

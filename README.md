@@ -82,3 +82,25 @@ for browsing and inspection.
 This repository's code was entirely written by **DeepSeek V4 Flash** in about 8 hours.
 If the UI tree parsing has issues or other bugs occur, provide the UI tree file and
 bug description to an AI to fix it.
+
+---
+
+## Windows Notes
+
+**Console window suppression:** On Windows, every ADB subprocess (e.g. `adb devices`,
+`screencap`, `pull`) previously flashed a console window. All ADB invocations now use a
+`CREATE_NO_WINDOW` flag to suppress this. If you see any ADB-related issues on Windows,
+check the `adb()` helper in `src/main.rs:37`.
+
+**Device refresh:** The toolbar's 🔄 button forces a refresh of the device list and
+display IDs. The list also auto-refreshes every 15 seconds while the app is running.
+
+> **Windows 注意事项：**
+>
+> **控制台窗口抑制：** 在 Windows 上，每次执行 ADB 子进程（如 `adb devices`、`screencap`、
+> `pull`）原本会闪烁一个控制台窗口。现在所有 ADB 调用都通过 `adb()` 辅助函数
+> （`src/main.rs:37`），带有 `CREATE_NO_WINDOW` 标志来抑制此现象。如果在 Windows
+> 上遇到任何 ADB 相关问题，请检查该函数。
+>
+> **设备刷新：** 工具栏的 🔄 按钮可强制刷新设备列表和显示 ID。列表在运行期间也会
+> 每 15 秒自动刷新一次。
