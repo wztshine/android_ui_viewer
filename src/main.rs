@@ -374,17 +374,19 @@ fn parse_windows_xml(text: &str, display_id: u32) -> Option<UiNode> {
         return None;
     };
     let display = display_node?;
-    // Two possible formats:
-    // 1) <display> <window> <hierarchy> <node/>... (--windows output)
-    // 2) <display> <node/>... (hybrid .uix format)
-    if let Some(window) = display.children().find(|c| c.is_element() && c.tag_name().name() == "window") {
-        if let Some(hierarchy) = window.children().find(|c| c.is_element() && c.tag_name().name() == "hierarchy") {
-            let nodes: Vec<UiNode> = hierarchy.children()
-                .filter(|c| c.is_element())
-                .filter_map(|c| parse_node(&c))
-                .collect();
-            return merge_nodes(nodes);
+    let has_window = display.children().any(|c| c.is_element() && c.tag_name().name() == "window");
+    if has_window {
+        let mut all_nodes: Vec<UiNode> = Vec::new();
+        for window in display.children().filter(|c| c.is_element() && c.tag_name().name() == "window") {
+            if let Some(hierarchy) = window.children().find(|c| c.is_element() && c.tag_name().name() == "hierarchy") {
+                let nodes: Vec<UiNode> = hierarchy.children()
+                    .filter(|c| c.is_element())
+                    .filter_map(|c| parse_node(&c))
+                    .collect();
+                all_nodes.extend(nodes);
+            }
         }
+        return merge_nodes(all_nodes);
     }
     // Direct <node> children under <display> — collect all as siblings
     let nodes: Vec<UiNode> = display.children()
