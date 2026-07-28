@@ -86,7 +86,10 @@ impl UiNode {
                     }
                     n.bounds.area()
                 };
-                if area < best_area {
+                if area < best_area
+                    || (area == best_area
+                        && found.len() > best_path.as_ref().map_or(0, |p| p.len()))
+                {
                     best_area = area;
                     best_path = Some(found);
                 }
