@@ -440,7 +440,7 @@ fn get_display_ids_from_xml(text: &str) -> Vec<u32> {
     Vec::new()
 }
 
-fn adb_capture(serial: &str, display_logical: u32, display_physical: u64, use_windows: bool) -> Result<(PathBuf, PathBuf), String> {
+fn adb_capture(serial: &str, display_logical: u32, display_physical: u64) -> Result<(PathBuf, PathBuf), String> {
     let tmp = std::env::temp_dir();
     let suffix = if display_logical > 0 { format!("_d{display_logical}") } else { String::new() };
     let png = tmp.join(format!("uiviewer_adb_screenshot{suffix}.png"));
@@ -464,18 +464,22 @@ fn adb_capture(serial: &str, display_logical: u32, display_physical: u64, use_wi
     std::fs::write(&png, &img.stdout).map_err(|e| format!("write png: {e}"))?;
     tmp_guard.track(png.clone());
 
-    let dump = if use_windows {
-        adb()
-            .args(["-s", serial, "shell", "uiautomator", "dump", "--windows", DEVICE_DUMP])
-            .output()
-    } else {
-        adb()
+    // Always try --windows first so U2 and ADB capture see the same window coverage.
+    // Without --windows, uiautomator dump only returns the active window root,
+    // while U2's dumpWindowHierarchy iterates getWindowRoots() (all windows).
+    // Fall back to non-windows dump if --windows is not supported (older Android).
+    let dump = adb()
+        .args(["-s", serial, "shell", "uiautomator", "dump", "--windows", DEVICE_DUMP])
+        .output()
+        .map_err(|e| format!("uiautomator dump failed: {e}"))?;
+    if !dump.status.success() {
+        let fallback = adb()
             .args(["-s", serial, "shell", "uiautomator", "dump", DEVICE_DUMP])
             .output()
-    }
-    .map_err(|e| format!("uiautomator dump failed: {e}"))?;
-    if !dump.status.success() {
-        return Err("uiautomator dump returned error".into());
+            .map_err(|e| format!("uiautomator dump failed (fallback): {e}"))?;
+        if !fallback.status.success() {
+            return Err("uiautomator dump returned error (both --windows and fallback)".into());
+        }
     }
 
     let pull = adb()
@@ -483,7 +487,7 @@ fn adb_capture(serial: &str, display_logical: u32, display_physical: u64, use_wi
         .output()
         .map_err(|e| format!("adb pull failed: {e}"))?;
 
-    // always clean up temp file on device
+    // always clean up temp files on device
     let _ = adb()
         .args(["-s", serial, "shell", "rm", DEVICE_DUMP])
         .output();
@@ -994,32 +998,17 @@ impl App {
         let old_png = self.temp_screenshot.take();
         let old_xml = self.temp_xml.take();
 
-        let multi_display = self.available_displays.len() > 1;
         let phys_id = self.available_displays.iter()
             .find(|(log, _)| *log == self.display_id)
             .map(|(_, phys)| *phys)
             .unwrap_or(0);
 
-        match adb_capture(&serial, self.display_id, phys_id, multi_display) {
+        match adb_capture(&serial, self.display_id, phys_id) {
             Ok((png, xml)) => {
                 self.load_screenshot(&png, ctx);
-                if multi_display {
-                    if let Ok(content) = std::fs::read_to_string(&xml) {
-                        self.file_displays = get_display_ids_from_xml(&content);
-                        self.file_xml_content = Some(content.clone());
-                        self.tree_display_id = self.display_id;
-                        self.last_tree_display_id = self.tree_display_id;
-                        self.root_node = parse_windows_xml(&content, self.tree_display_id);
-                        if self.root_node.is_none() {
-                            eprintln!("Failed to parse --windows XML for display {}", self.tree_display_id);
-                        }
-                    }
-                } else {
-                    self.file_displays.clear();
-                    self.file_xml_content = None;
-                    self.load_xml(&xml, ctx);
-                }
-                self.xml_path = Some(xml.clone());
+                self.load_xml(&xml, ctx);
+                self.tree_display_id = self.display_id;
+                self.last_tree_display_id = self.tree_display_id;
                 self.temp_screenshot = Some(png);
                 self.temp_xml = Some(xml);
                 self.status_message = Some("ADB capture successful".into());
