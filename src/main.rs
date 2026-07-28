@@ -59,12 +59,16 @@ struct UiNode {
 }
 
 fn adb() -> Command {
-    let mut cmd = Command::new("adb");
     #[cfg(target_os = "windows")]
     {
+        let mut cmd = Command::new("adb");
         cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
     }
-    cmd
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("adb")
+    }
 }
 
 impl UiNode {
@@ -652,6 +656,19 @@ fn extract_xml(raw: &[u8]) -> Vec<u8> {
     raw.to_vec()
 }
 
+fn pidof_atx_agent(serial: &str) -> bool {
+    adb()
+        .args(["-s", serial, "shell", "pidof", "atx-agent"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            Some(s.split_whitespace().next()?.parse::<u32>().ok()?)
+        })
+        .is_some()
+}
+
 fn uiautomator2_capture(serial: &str, display_id: u32) -> Result<(PathBuf, PathBuf), String> {
     let tmp = std::env::temp_dir();
     let suffix = if display_id > 0 { format!("_d{display_id}") } else { String::new() };
@@ -661,18 +678,18 @@ fn uiautomator2_capture(serial: &str, display_id: u32) -> Result<(PathBuf, PathB
 
     // Check if atx-agent is already running — if so, reuse it
     if !U2_STARTED.load(Ordering::Relaxed) {
-        let already_running = adb()
-            .args(["-s", serial, "shell", "pidof", "atx-agent"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| {
-                let s = String::from_utf8_lossy(&o.stdout);
-                Some(s.split_whitespace().next()?.parse::<u32>().ok()?)
-            })
-            .is_some();
+        if !pidof_atx_agent(serial) {
+            // Check if binary exists first
+            let exists = adb()
+                .args(["-s", serial, "shell", "ls", ATX_AGENT])
+                .output()
+                .ok()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !exists {
+                return Err(format!("{ATX_AGENT} not found on device — run 'python -m uiautomator2 init' to install"));
+            }
 
-        if !already_running {
             let _ = adb()
                 .args(["-s", serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
                 .output();
@@ -681,24 +698,30 @@ fn uiautomator2_capture(serial: &str, display_id: u32) -> Result<(PathBuf, PathB
                 .args(["-s", serial, "shell", "am force-stop com.github.uiautomator"])
                 .output();
             // Start atx-agent server in daemon mode (-d is a flag of the server subcommand)
-            let _ = adb()
+            let start_output = adb()
                 .args(["-s", serial, "shell", ATX_AGENT, "server", "-d"])
                 .output();
-            std::thread::sleep(std::time::Duration::from_millis(2000));
+            if let Ok(ref out) = start_output {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.trim().is_empty() {
+                    eprintln!("atx-agent start stderr: {stderr}");
+                }
+            }
 
-            // Verify atx-agent started
-            let ok = adb()
-                .args(["-s", serial, "shell", "pidof", "atx-agent"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| {
-                    let s = String::from_utf8_lossy(&o.stdout);
-                    Some(s.split_whitespace().next()?.parse::<u32>().ok()?)
-                })
-                .is_some();
+            // Retry pidof check up to 5 times (total ~10s) for slow devices
+            let mut ok = false;
+            for i in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+                ok = pidof_atx_agent(serial);
+                if ok {
+                    eprintln!("atx-agent confirmed running after {}s", (i + 1) * 2);
+                    break;
+                }
+            }
             if !ok {
-                return Err(format!("{ATX_AGENT} failed to start — check if binary exists and is executable"));
+                return Err(format!(
+                    "{ATX_AGENT} failed to start after 10s — check device log for details"
+                ));
             }
         }
         U2_STARTED.store(true, Ordering::Relaxed);
@@ -738,7 +761,18 @@ fn uiautomator2_capture(serial: &str, display_id: u32) -> Result<(PathBuf, PathB
             let _ = adb()
                 .args(["-s", serial, "shell", ATX_AGENT, "server", "-d"])
                 .output();
-            std::thread::sleep(std::time::Duration::from_millis(2000));
+            // Wait for atx-agent to restart (retry up to 5 times)
+            let mut restarted = false;
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+                if pidof_atx_agent(serial) {
+                    restarted = true;
+                    break;
+                }
+            }
+            if !restarted {
+                return Err(format!("{ATX_AGENT} failed to restart after APK install"));
+            }
         }
         // APK file not on device — proceed, screenshot may still work
     }
