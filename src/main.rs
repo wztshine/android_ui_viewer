@@ -236,6 +236,7 @@ struct App {
     pending_capture_method: Option<CaptureMethod>,
     pending_old_screenshot: Option<PathBuf>,
     pending_old_xml: Option<PathBuf>,
+    refresh_rx: Option<mpsc::Receiver<DeviceRefresh>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -245,6 +246,12 @@ enum CaptureMethod {
 }
 
 type CaptureResult = Result<(PathBuf, PathBuf), String>;
+
+struct DeviceRefresh {
+    devices: Vec<String>,
+    selected: Option<String>,
+    displays: Option<Vec<(u32, u64)>>,
+}
 
 impl Default for App {
     fn default() -> Self {
@@ -285,6 +292,7 @@ impl Default for App {
             pending_capture_method: None,
             pending_old_screenshot: None,
             pending_old_xml: None,
+            refresh_rx: None,
         }
     }
 }
@@ -585,6 +593,27 @@ fn get_displays(serial: &str) -> Vec<(u32, u64)> {
         let phys = logical_to_physical.get(&log).copied().unwrap_or(0);
         (log, phys)
     }).collect()
+}
+
+fn fetch_device_refresh(current_serial: Option<String>) -> DeviceRefresh {
+    let mut devices = Vec::new();
+    if let Ok(out) = adb().args(["devices"]).output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines().skip(1) {
+            if let Some(serial) = line.split('\t').next() {
+                if !serial.is_empty() && line.contains("\tdevice") {
+                    devices.push(serial.to_string());
+                }
+            }
+        }
+    }
+    let target = current_serial
+        .as_ref()
+        .filter(|s| devices.iter().any(|d| d == *s))
+        .cloned()
+        .or_else(|| devices.first().cloned());
+    let displays = target.as_deref().map(get_displays);
+    DeviceRefresh { devices, selected: target, displays }
 }
 
 fn http_get(path: &str) -> Result<Vec<u8>, String> {
@@ -959,37 +988,52 @@ impl App {
         }
     }
 
-    fn refresh_devices(&mut self) {
+    fn refresh_devices(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         if self.last_adb_check.is_some_and(|t| now - t < std::time::Duration::from_secs(15)) {
             return;
         }
+        if self.refresh_rx.is_some() {
+            return;
+        }
         self.last_adb_check = Some(now);
-        self.adb_devices.clear();
-        if let Ok(out) = adb()
-            .args(["devices"])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines().skip(1) {
-                if let Some(serial) = line.split('\t').next() {
-                    if !serial.is_empty() && line.contains("\tdevice") {
-                        self.adb_devices.push(serial.to_string());
+        let current = self.selected_device.clone();
+        let (tx, rx) = mpsc::channel();
+        let thread_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = fetch_device_refresh(current);
+            if tx.send(result).is_ok() {
+                thread_ctx.request_repaint();
+            }
+        });
+        self.refresh_rx = Some(rx);
+    }
+
+    fn poll_device_refresh(&mut self) {
+        let outcome = self.refresh_rx.as_ref().map(|rx| rx.try_recv());
+        match outcome {
+            Some(Ok(result)) => {
+                self.refresh_rx = None;
+                self.adb_devices = result.devices;
+                if !self.adb_devices.contains(&self.selected_device.as_deref().unwrap_or_default().to_string()) {
+                    self.selected_device = self.adb_devices.first().cloned();
+                }
+                if self.selected_device == result.selected {
+                    if let Some(ids) = result.displays {
+                        if ids != self.available_displays {
+                            self.available_displays = ids;
+                            if !self.available_displays.iter().any(|(log, _)| *log == self.display_id) {
+                                self.display_id = self.available_displays[0].0;
+                            }
+                        }
                     }
                 }
             }
-        }
-        if !self.adb_devices.contains(&self.selected_device.as_deref().unwrap_or_default().to_string()) {
-            self.selected_device = self.adb_devices.first().cloned();
-        }
-        if let Some(ref serial) = self.selected_device {
-            let ids = get_displays(serial);
-            if ids != self.available_displays {
-                self.available_displays = ids;
-                if !self.available_displays.iter().any(|(log, _)| *log == self.display_id) {
-                    self.display_id = self.available_displays[0].0;
-                }
+            Some(Err(mpsc::TryRecvError::Empty)) => return,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.refresh_rx = None;
             }
+            None => {}
         }
     }
 
@@ -1120,8 +1164,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.capturing {
-            self.refresh_devices();
+            self.refresh_devices(&ctx);
         }
+        self.poll_device_refresh();
         self.poll_capture(&ctx);
 
         // Handle double-click tap — two-phase: tap now, capture after settle
@@ -1216,7 +1261,7 @@ impl eframe::App for App {
                 }
                 if ui.button("🔄 Refresh device").clicked() {
                     self.last_adb_check = None;
-                    self.refresh_devices();
+                    self.refresh_devices(&ctx);
                 }
                 if !self.adb_devices.is_empty() {
                     let current = self.selected_device.clone().unwrap_or_default();
