@@ -1632,7 +1632,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_decorations(true),
+            .with_decorations(true)
+            .with_inner_size([1280.0, 800.0]),
         centered: true,
         ..Default::default()
     };
