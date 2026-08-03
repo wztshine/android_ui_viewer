@@ -56,6 +56,7 @@ struct UiNode {
     bounds: Rect,
     attrs: Vec<(String, String)>,
     children: Vec<UiNode>,
+    label: String,
 }
 
 fn adb() -> Command {
@@ -112,19 +113,24 @@ impl UiNode {
         }
         Some(node)
     }
-
-    fn get_attr(&self, key: &str) -> Option<&str> {
-        self.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
-    }
 }
 
-fn tree_label(node: &UiNode) -> String {
-    let cls = node
-        .get_attr("class")
-        .map(|c| c.rsplit('.').next().unwrap_or(c))
+fn build_label(attrs: &[(String, String)]) -> String {
+    let cls = attrs
+        .iter()
+        .find(|(k, _)| k == "class")
+        .map(|(_, v)| v.rsplit('.').next().unwrap_or(v))
         .unwrap_or("?");
-    let text = node.get_attr("text").filter(|v| !v.is_empty() && *v != "null");
-    let rid = node.get_attr("resource-id").filter(|v| !v.is_empty() && *v != "null");
+    let text = attrs
+        .iter()
+        .find(|(k, _)| k == "text")
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty() && *v != "null");
+    let rid = attrs
+        .iter()
+        .find(|(k, _)| k == "resource-id")
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty() && *v != "null");
     let rid_short = rid.and_then(|r| r.rsplit('/').next());
 
     let mut s = cls.to_string();
@@ -178,13 +184,13 @@ fn render_tree(
             ui.add_space(14.0);
         }
 
-        let label = tree_label(node);
+        let label = &node.label;
         let rich = if is_selected {
-            egui::RichText::new(&label).color(Color32::from_rgb(0, 150, 0))
+            egui::RichText::new(label).color(Color32::from_rgb(0, 150, 0))
         } else if is_hovered {
-            egui::RichText::new(&label).color(Color32::RED)
+            egui::RichText::new(label).color(Color32::RED)
         } else {
-            egui::RichText::new(&label)
+            egui::RichText::new(label)
         };
         let resp = ui.add(egui::Label::new(rich));
         node_rects.push((path.to_vec(), resp.rect));
@@ -334,6 +340,7 @@ fn parse_node(node: &roxmltree::Node) -> Option<UiNode> {
         .attributes()
         .map(|a| (a.name().to_string(), a.value().to_string()))
         .collect();
+    let label = build_label(&attrs);
 
     let children: Vec<UiNode> = node
         .children()
@@ -341,7 +348,7 @@ fn parse_node(node: &roxmltree::Node) -> Option<UiNode> {
         .filter_map(|c| parse_node(&c))
         .collect();
 
-    Some(UiNode { bounds, attrs, children })
+    Some(UiNode { bounds, attrs, children, label })
 }
 
 fn parse_xml(text: &str) -> Option<UiNode> {
@@ -367,10 +374,13 @@ fn merge_nodes(nodes: Vec<UiNode>) -> Option<UiNode> {
     let bounds = nodes.iter().fold(None, |acc: Option<Rect>, n| {
         Some(acc.map(|r| r.union(n.bounds)).unwrap_or(n.bounds))
     }).unwrap_or(Rect::from_min_max(pos2(0.0, 0.0), pos2(0.0, 0.0)));
+    let attrs = vec![("class".into(), "android.widget.FrameLayout".into())];
+    let label = build_label(&attrs);
     Some(UiNode {
         bounds,
-        attrs: vec![("class".into(), "android.widget.FrameLayout".into())],
+        attrs,
         children: nodes,
+        label,
     })
 }
 
@@ -1029,7 +1039,7 @@ impl App {
                     }
                 }
             }
-            Some(Err(mpsc::TryRecvError::Empty)) => return,
+            Some(Err(mpsc::TryRecvError::Empty)) => {}
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.refresh_rx = None;
             }
@@ -1372,7 +1382,7 @@ impl eframe::App for App {
             ui.separator();
 
             let tree_max = (ui.available_height() * 0.45).max(100.0);
-            let mut expanded = self.expanded.clone();
+            let mut expanded = std::mem::take(&mut self.expanded);
             egui::ScrollArea::vertical()
                 .id_salt("tree_scroll")
                 .max_height(tree_max)
