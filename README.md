@@ -2,11 +2,11 @@
 
 A Rust desktop application for inspecting Android UI layouts from uiautomator XML dumps.
 Built with [egui](https://github.com/emilk/egui) (immediate-mode GUI).
-Single file (~1540 lines) located at `src/main.rs`.
+Single file (~1753 lines) located at `src/main.rs`.
 
 一款 Rust 桌面工具，从 uiautomator XML dump 中检查 Android UI 布局。
 基于 [egui](https://github.com/emilk/egui)（即时模式 GUI）构建。
-单一文件（约 1540 行），位于 `src/main.rs`。
+单一文件（约 1753 行），位于 `src/main.rs`。
 
 ## Features / 功能
 
@@ -109,8 +109,12 @@ On Windows, every ADB subprocess (e.g. `adb devices`, `screencap`, `pull`) previ
 在 Windows 上，每次执行 ADB 子进程（如 `adb devices`、`screencap`、`pull`）原本会闪烁一个控制台窗口。现在所有 ADB 调用都通过 `adb()` 辅助函数，带有 `CREATE_NO_WINDOW` 标志来抑制此现象。
 
 **Device refresh / 设备刷新:**  
-The toolbar's 🔄 button forces a refresh of the device list and display IDs. The list also auto-refreshes every 15 seconds while the app is running.  
-工具栏的 🔄 按钮可强制刷新设备列表和显示 ID。列表在运行期间也会每 15 秒自动刷新一次。
+The toolbar's 🔄 button forces a refresh of the device list and display IDs. The list also auto-refreshes every 15 seconds while the app is running. Refreshes run on a background thread, so the UI never blocks while querying adb.  
+工具栏的 🔄 按钮可强制刷新设备列表和显示 ID。列表在运行期间也会每 15 秒自动刷新一次。刷新在后台线程执行，查询 adb 时 UI 不会卡顿。
+
+**Background capture / 后台捕获:**  
+Captures (ADB/U2) run on a background thread, keeping the UI responsive. A capture that hangs is abandoned after 30 seconds (`CAPTURE_TIMEOUT`) and the previous view is restored.  
+捕获（ADB/U2）在后台线程执行，UI 保持响应。挂起的捕获会在 30 秒（`CAPTURE_TIMEOUT`）后被放弃并恢复之前的视图。
 
 **Rust version / Rust 版本:**  
 Requires Rust **1.92+** (MSRV dictated by eframe 0.35).  

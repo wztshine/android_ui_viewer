@@ -22,7 +22,7 @@ uiautomator2 (JSON-RPC) capture, manual file loading, and save-as.
 
 ```
 /var/my_share/projects/uiviewer/
-├── src/main.rs      # single-file app (~1540 lines)
+├── src/main.rs      # single-file app (~1753 lines)
 ├── Cargo.toml
 ├── AGENTS.md
 └── README.md
@@ -32,12 +32,13 @@ uiautomator2 (JSON-RPC) capture, manual file loading, and save-as.
 
 ### Core Types
 
-- **`UiNode`** — tree node from XML: `bounds`, `attrs`, `children`
+- **`UiNode`** — tree node from XML: `bounds`, `attrs`, `children`, precomputed `label`
   - `find_branch(pos, path)` — finds the smallest-area node at image pixel (walks children first, then checks own bounds; handles child bounds exceeding parent)
   - `node_at(path)` — follows `Vec<usize>` path to a node
 - **`App`** — egui app state with screenshot/texture, paths, expanded set, selection/hover state
 - **`CaptureMethod`** — `Adb` | `U2`
 - **`TempGuard`** — RAII temp file cleanup: tracks files during capture, removes on Drop/error, `disarm()` on success
+- **`DeviceRefresh`** — background device-list + display result (`devices`, `selected`, `displays`) sent via mpsc
 
 ### Key Functions
 
@@ -49,11 +50,14 @@ uiautomator2 (JSON-RPC) capture, manual file loading, and save-as.
 | `merge_nodes(nodes)` | Wrap multiple root nodes in a synthetic `FrameLayout` root |
 | `load_texture(path, ctx)` | Load PNG/JPEG into egui texture |
 | `get_displays(serial)` | Query device for `Vec<(logical_id, physical_id)>` via `dumpsys display` + `dumpsys SurfaceFlinger --display-id` |
-| `adb_capture(serial, display_logical, display_physical, use_windows)` | ADB capture: `screencap -p [-d <phys>]` + `uiautomator dump [--windows]` + `adb pull` |
-| `uiautomator2_capture(serial, display_id)` | U2 capture: atx-agent lifecycle, `/screenshot/{id}` + `/dump/hierarchy` via raw TCP |
+| `adb_capture(serial, display_physical, png, xml)` | ADB capture: `screencap -p [-d <phys>]` + `uiautomator dump [--windows]` + `adb pull`; writes to given unique temp paths |
+| `uiautomator2_capture(serial, display_id, png, xml)` | U2 capture: atx-agent lifecycle, `/screenshot/{id}` + `/dump/hierarchy` via raw TCP; writes to given unique temp paths |
 | `http_get(path)` | Send raw HTTP GET to atx-agent (U2 JSON-RPC) |
 | `render_tree(ui, node, ...)` | Recursively render collapsible tree with arrows, indentation, colored labels |
-| `tree_label(node)` | Format node label: `ClassName "text" [resource-id]` |
+| `build_label(attrs)` | Format node label `ClassName "text" [resource-id]`; precomputed once at parse time into `UiNode.label` (zero per-frame allocation) |
+| `start_capture(method)` / `poll_capture` | Background-thread capture: spawns thread + mpsc channel, polls result each frame |
+| `refresh_devices` / `poll_device_refresh` | Background-thread device/display refresh (15s rate-limited), mpsc result applied off-thread |
+| `next_temp_id()` | `AtomicU64` counter for unique temp file names (`TEMP_COUNTER`) |
 
 ### Layout Structure
 
@@ -118,25 +122,34 @@ trigger auto-scroll-to-focused-widget behavior.
 
 ### Capture Lifecycle
 
+Captures run on a **background thread**: `start_capture(method)` spawns the thread and an mpsc
+channel; `poll_capture` polls the result every frame. The UI stays responsive and toolbar
+buttons are disabled while `capturing`.
+
+#### Background execution
+- `start_capture`: generates unique temp paths, stores them in `in_flight_screenshot`/`in_flight_xml`, spawns thread, sends `CaptureResult` via mpsc, requests repaint on completion
+- `poll_capture`: polls the channel; Empty → `ctx.request_repaint_after` schedules a wake-up at the `CAPTURE_TIMEOUT` (30s) deadline (fires even without user input); Ok → load + track temps; Err/timeout/Disconnected → restore previous temps and clear `in_flight_*`
+- Timeout: drops the receiver so the zombie thread's eventual send fails and its SendError arm self-cleans its own files
+
 #### ADB Capture
 - Kills atx-agent + uiautomator only if `U2_STARTED` was true (avoid unnecessary overhead for pure ADB sessions)
 - Resets `U2_STARTED` to false
 
 #### U2 Capture
-- First capture: kills any existing atx-agent → starts fresh → waits 2s → verifies pidof
-- Subsequent captures: reuses running atx-agent
+- First capture: kills any existing atx-agent → starts fresh → verifies pidof (retries up to 5×2s)
+- Subsequent captures: reuses running atx-agent; reinstalls `app-uiautomator.apk` if missing (restart + verify)
 - If atx-agent died mid-session: capture fails → resets `U2_STARTED` → next attempt restarts
 
-#### Exit Cleanup (`main()`)
-- Reads `U2_SERIAL` mutex: only cleans (kill atx-agent, am force-stop uiautomator, remove adb forward) if U2 was used this session
+#### Exit Cleanup
+- `main()`: reads `U2_SERIAL` mutex — only cleans (kill atx-agent, am force-stop uiautomator, remove adb forward) if U2 was used this session
+- `App::drop`: removes tracked temp files (`temp_*` + `pending_old_*` + `in_flight_*`), covering exits mid-capture and zombies left after timeout
 
 #### Temp Files
-- `std::env::temp_dir()` → `uiviewer_{adb|u2}_screenshot[_dN].png` / `uiviewer_{adb|u2}_dump[_dN].xml`
-- `_dN` suffix when `display_id > 0` (multi-display)
-- On success: tracked in `temp_screenshot`/`temp_xml`
-- On new capture: old temps cleaned first
-- On error: cleanup partial files; rollback preserves old temps
-- On app exit: `Drop::drop` removes both temps
+- `std::env::temp_dir()` → `uiviewer_{adb|u2}_{screenshot|dump}_{id}.png/.xml`, unique `id` from `TEMP_COUNTER` (paths generated in `start_capture` so Drop can clean them)
+- Success: previous unique files removed, new files tracked in `temp_screenshot`/`temp_xml`
+- Error: thread `TempGuard` removes partial files; previous temps restored
+- Timeout: previous temps restored; zombie thread self-cleans via SendError once its adb returns; `in_flight_*` covers exit-time cleanup
+- User load: `load_screenshot`/`load_xml` remove the tracked temp before replacing it
 
 ## Common Commands
 
@@ -157,14 +170,17 @@ Device detection: `adb devices` → picks the first connected device. No hard-co
 On Windows, every `adb` subprocess spawn (e.g. `adb devices`, `adb shell`,
 `screencap`, `adb pull`) would flash a console window briefly because the parent
 process has no console (detached via `FreeConsole()`). All ADB invocations go
-through the `adb()` helper (`main.rs:37`) which sets `CREATE_NO_WINDOW` on Windows
+through the `adb()` helper (`main.rs:68`) which sets `CREATE_NO_WINDOW` on Windows
 to suppress this.
 
 ### Device Refresh Caching
 `refresh_devices()` is called at the start of every `ui()` frame but is rate-limited
-to once every 15 seconds (using `last_adb_check: Option<Instant>`). This prevents
-spawning `adb devices` on every mouse move / repaint. A manual 🔄 button in the
-toolbar resets `last_adb_check` to `None` and triggers an immediate refresh.
+to once every 15 seconds (using `last_adb_check: Option<Instant>`). The adb calls
+(`adb devices` + 2× `dumpsys`) run on a **background thread** via `fetch_device_refresh`,
+and the result is applied off-thread by `poll_device_refresh`:
+- A `refresh_rx` in flight blocks duplicate concurrent refreshes (manual 🔄 button is deduped too)
+- A `selected == result.selected` guard skips applying displays fetched for a stale device selection
+A manual 🔄 button in the toolbar resets `last_adb_check` to `None` and triggers an immediate refresh.
 
 ### ADB calls
 All 28+ `Command::new("adb")` calls in the codebase have been replaced with `adb()`,

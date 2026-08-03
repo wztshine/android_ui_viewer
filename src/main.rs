@@ -8,7 +8,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
@@ -20,12 +20,18 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 static U2_STARTED: AtomicBool = AtomicBool::new(false);
 static U2_SERIAL: Mutex<Option<String>> = Mutex::new(None);
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_temp_id() -> u64 {
+    TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 const U2_ADDR: &str = "127.0.0.1:7912";
 const U2_FORWARD: &str = "tcp:7912";
 const ATX_AGENT: &str = "/data/local/tmp/atx-agent";
 const UIAUTOMATOR_APK: &str = "/data/local/tmp/app-uiautomator.apk";
 const DEVICE_DUMP: &str = "/sdcard/uiviewer_dump.xml";
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct TempGuard {
     files: Vec<PathBuf>,
@@ -145,7 +151,7 @@ fn build_label(attrs: &[(String, String)]) -> String {
     if s.len() > 100 {
         let b = s.floor_char_boundary(97);
         s.truncate(b);
-        s.push_str("…");
+        s.push('…');
     }
     s
 }
@@ -238,10 +244,13 @@ struct App {
     drag_start_img: Option<Pos2>,
     last_adb_check: Option<Instant>,
     capturing: bool,
+    capture_start: Option<Instant>,
     capture_rx: Option<mpsc::Receiver<CaptureResult>>,
     pending_capture_method: Option<CaptureMethod>,
     pending_old_screenshot: Option<PathBuf>,
     pending_old_xml: Option<PathBuf>,
+    in_flight_screenshot: Option<PathBuf>,
+    in_flight_xml: Option<PathBuf>,
     refresh_rx: Option<mpsc::Receiver<DeviceRefresh>>,
 }
 
@@ -294,10 +303,13 @@ impl Default for App {
             drag_start_img: None,
             last_adb_check: None,
             capturing: false,
+            capture_start: None,
             capture_rx: None,
             pending_capture_method: None,
             pending_old_screenshot: None,
             pending_old_xml: None,
+            in_flight_screenshot: None,
+            in_flight_xml: None,
             refresh_rx: None,
         }
     }
@@ -305,15 +317,23 @@ impl Default for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        for p in [self.temp_screenshot.take(), self.pending_old_screenshot.take()]
-            .into_iter()
-            .flatten()
+        for p in [
+            self.temp_screenshot.take(),
+            self.pending_old_screenshot.take(),
+            self.in_flight_screenshot.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             let _ = std::fs::remove_file(&p);
         }
-        for p in [self.temp_xml.take(), self.pending_old_xml.take()]
-            .into_iter()
-            .flatten()
+        for p in [
+            self.temp_xml.take(),
+            self.pending_old_xml.take(),
+            self.in_flight_xml.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             let _ = std::fs::remove_file(&p);
         }
@@ -483,11 +503,7 @@ fn get_display_ids_from_xml(text: &str) -> Vec<u32> {
     Vec::new()
 }
 
-fn adb_capture(serial: &str, display_logical: u32, display_physical: u64) -> Result<(PathBuf, PathBuf), String> {
-    let tmp = std::env::temp_dir();
-    let suffix = if display_logical > 0 { format!("_d{display_logical}") } else { String::new() };
-    let png = tmp.join(format!("uiviewer_adb_screenshot{suffix}.png"));
-    let xml = tmp.join(format!("uiviewer_adb_dump{suffix}.xml"));
+fn adb_capture(serial: &str, display_physical: u64, png: PathBuf, xml: PathBuf) -> Result<(PathBuf, PathBuf), String> {
     let mut tmp_guard = TempGuard::new();
 
     let img = if display_physical > 0 {
@@ -504,41 +520,47 @@ fn adb_capture(serial: &str, display_logical: u32, display_physical: u64) -> Res
     if !img.status.success() {
         return Err("screencap returned error".into());
     }
-    std::fs::write(&png, &img.stdout).map_err(|e| format!("write png: {e}"))?;
     tmp_guard.track(png.clone());
+    std::fs::write(&png, &img.stdout).map_err(|e| format!("write png: {e}"))?;
 
     // Always try --windows first so U2 and ADB capture see the same window coverage.
     // Without --windows, uiautomator dump only returns the active window root,
     // while U2's dumpWindowHierarchy iterates getWindowRoots() (all windows).
     // Fall back to non-windows dump if --windows is not supported (older Android).
-    let dump = adb()
-        .args(["-s", serial, "shell", "uiautomator", "dump", "--windows", DEVICE_DUMP])
-        .output()
-        .map_err(|e| format!("uiautomator dump failed: {e}"))?;
-    if !dump.status.success() {
-        let fallback = adb()
-            .args(["-s", serial, "shell", "uiautomator", "dump", DEVICE_DUMP])
-            .output()
-            .map_err(|e| format!("uiautomator dump failed (fallback): {e}"))?;
-        if !fallback.status.success() {
-            return Err("uiautomator dump returned error (both --windows and fallback)".into());
-        }
+    let dump_ok = {
+        let first = adb()
+            .args(["-s", serial, "shell", "uiautomator", "dump", "--windows", DEVICE_DUMP])
+            .output();
+        matches!(first, Ok(out) if out.status.success())
+            || matches!(
+                adb()
+                    .args(["-s", serial, "shell", "uiautomator", "dump", DEVICE_DUMP])
+                    .output(),
+                Ok(out) if out.status.success()
+            )
+    };
+    if !dump_ok {
+        // uiautomator can write the dump file yet still exit non-zero, so always
+        // attempt to remove the on-device temp file before giving up.
+        let _ = adb().args(["-s", serial, "shell", "rm", DEVICE_DUMP]).output();
+        return Err("uiautomator dump returned error (both --windows and fallback)".into());
     }
 
     let pull = adb()
-        .args(["-s", serial, "pull", DEVICE_DUMP, &xml.to_string_lossy().to_string()])
-        .output()
-        .map_err(|e| format!("adb pull failed: {e}"))?;
-
-    // always clean up temp files on device
+        .args(["-s", serial, "pull", DEVICE_DUMP, xml.to_string_lossy().as_ref()])
+        .output();
+    // Always clean up the on-device temp file, regardless of the pull outcome.
     let _ = adb()
         .args(["-s", serial, "shell", "rm", DEVICE_DUMP])
         .output();
-
-    if !pull.status.success() {
-        return Err("adb pull returned error".into());
-    }
+    // Track before checking status so a partial/empty pull file is cleaned too.
     tmp_guard.track(xml.clone());
+
+    match pull {
+        Ok(out) if out.status.success() => {}
+        Ok(_) => return Err("adb pull returned error".into()),
+        Err(e) => return Err(format!("adb pull failed: {e}")),
+    }
 
     tmp_guard.disarm();
     Ok((png, xml))
@@ -724,16 +746,12 @@ fn pidof_atx_agent(serial: &str) -> bool {
         .filter(|o| o.status.success())
         .and_then(|o| {
             let s = String::from_utf8_lossy(&o.stdout);
-            Some(s.split_whitespace().next()?.parse::<u32>().ok()?)
+            s.split_whitespace().next()?.parse::<u32>().ok()
         })
         .is_some()
 }
 
-fn uiautomator2_capture(serial: &str, display_id: u32) -> Result<(PathBuf, PathBuf), String> {
-    let tmp = std::env::temp_dir();
-    let suffix = if display_id > 0 { format!("_d{display_id}") } else { String::new() };
-    let png = tmp.join(format!("uiviewer_u2_screenshot{suffix}.png"));
-    let xml = tmp.join(format!("uiviewer_u2_dump{suffix}.xml"));
+fn uiautomator2_capture(serial: &str, display_id: u32, png: PathBuf, xml: PathBuf) -> Result<(PathBuf, PathBuf), String> {
     let mut tmp_guard = TempGuard::new();
 
     // Check if atx-agent is already running — if so, reuse it
@@ -869,15 +887,15 @@ fn uiautomator2_capture(serial: &str, display_id: u32) -> Result<(PathBuf, PathB
             std::thread::sleep(std::time::Duration::from_millis(800));
         }
     };
-    std::fs::write(&png, &png_bytes).map_err(|e| format!("write png: {e}"))?;
     tmp_guard.track(png.clone());
+    std::fs::write(&png, &png_bytes).map_err(|e| format!("write png: {e}"))?;
 
     // Hierarchy dump: GET /dump/hierarchy → JSON-wrapped XML
     let raw = http_get("/dump/hierarchy")
         .map_err(|e| format!("dump: {e}"))?;
     let xml_bytes = extract_xml(&raw);
-    std::fs::write(&xml, &xml_bytes).map_err(|e| format!("write xml: {e}"))?;
     tmp_guard.track(xml.clone());
+    std::fs::write(&xml, &xml_bytes).map_err(|e| format!("write xml: {e}"))?;
 
     tmp_guard.disarm();
     Ok((png, xml))
@@ -1061,11 +1079,12 @@ impl App {
         };
 
         self.capturing = true;
+        self.capture_start = Some(Instant::now());
         self.status_message = Some("Capturing...".into());
         self.status_is_error = false;
 
-        // Take old temp paths out of tracking so load_screenshot/load_xml won't
-        // delete the freshly-captured files (temp paths are deterministic/reused).
+        // Take old temp paths out of tracking so a success/error can either
+        // clean them or restore them independently of the fresh capture files.
         let old_png = self.temp_screenshot.take();
         let old_xml = self.temp_xml.take();
 
@@ -1075,6 +1094,23 @@ impl App {
             .map(|(_, phys)| *phys)
             .unwrap_or(0);
         let u2_started = U2_STARTED.load(Ordering::Relaxed);
+
+        // Generate unique temp paths here (main thread) so App::drop can clean
+        // up even when the capture thread is still running at exit.
+        let id = next_temp_id();
+        let tmp = std::env::temp_dir();
+        let (png, xml) = match method {
+            CaptureMethod::Adb => (
+                tmp.join(format!("uiviewer_adb_screenshot_{id}.png")),
+                tmp.join(format!("uiviewer_adb_dump_{id}.xml")),
+            ),
+            CaptureMethod::U2 => (
+                tmp.join(format!("uiviewer_u2_screenshot_{id}.png")),
+                tmp.join(format!("uiviewer_u2_dump_{id}.xml")),
+            ),
+        };
+        self.in_flight_screenshot = Some(png.clone());
+        self.in_flight_xml = Some(xml.clone());
 
         let (tx, rx) = mpsc::channel();
         self.capture_rx = Some(rx);
@@ -1095,9 +1131,9 @@ impl App {
                             .output();
                         U2_STARTED.store(false, Ordering::Relaxed);
                     }
-                    adb_capture(&serial, display_id, phys_id)
+                    adb_capture(&serial, phys_id, png.clone(), xml.clone())
                 }
-                CaptureMethod::U2 => uiautomator2_capture(&serial, display_id),
+                CaptureMethod::U2 => uiautomator2_capture(&serial, display_id, png, xml),
             };
             match tx.send(result) {
                 Ok(_) => thread_ctx.request_repaint(),
@@ -1119,11 +1155,36 @@ impl App {
             None => return,
             Some(rx) => match rx.try_recv() {
                 Ok(r) => r,
-                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Empty) => {
+                    if let Some(start) = self.capture_start {
+                        let elapsed = start.elapsed();
+                        if elapsed >= CAPTURE_TIMEOUT {
+                            // Abandon the hung capture: dropping the receiver makes the
+                            // thread's eventual send fail, so it removes its own fresh
+                            // temp files (see SendError arm in start_capture).
+                            self.capture_rx = None;
+                            self.capturing = false;
+                            self.capture_start = None;
+                            self.pending_capture_method = None;
+                            self.temp_screenshot = self.pending_old_screenshot.take();
+                            self.temp_xml = self.pending_old_xml.take();
+                            self.status_message = Some("capture timed out — device not responding".into());
+                            self.status_is_error = true;
+                        } else {
+                            // Wake up precisely at the deadline so the timeout fires
+                            // even without user input (no always-on repaint loop).
+                            ctx.request_repaint_after(CAPTURE_TIMEOUT - elapsed);
+                        }
+                    }
+                    return;
+                }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.capture_rx = None;
                     self.capturing = false;
+                    self.capture_start = None;
                     self.pending_capture_method = None;
+                    self.in_flight_screenshot = None;
+                    self.in_flight_xml = None;
                     self.temp_screenshot = self.pending_old_screenshot.take();
                     self.temp_xml = self.pending_old_xml.take();
                     self.status_message = Some("capture failed: background thread ended unexpectedly".into());
@@ -1135,18 +1196,28 @@ impl App {
 
         self.capture_rx = None;
         self.capturing = false;
+        self.capture_start = None;
         let is_u2 = self.pending_capture_method.take() == Some(CaptureMethod::U2);
         let old_png = self.pending_old_screenshot.take();
         let old_xml = self.pending_old_xml.take();
 
         match result {
             Ok((png, xml)) => {
+                // The previous capture's unique temp files are no longer needed.
+                if let Some(p) = old_png {
+                    let _ = std::fs::remove_file(&p);
+                }
+                if let Some(p) = old_xml {
+                    let _ = std::fs::remove_file(&p);
+                }
                 self.load_screenshot(&png, ctx);
                 self.load_xml(&xml, ctx);
                 self.tree_display_id = self.display_id;
                 self.last_tree_display_id = self.tree_display_id;
                 self.temp_screenshot = Some(png);
                 self.temp_xml = Some(xml);
+                self.in_flight_screenshot = None;
+                self.in_flight_xml = None;
                 self.status_message = Some(if is_u2 {
                     "uiautomator2 capture successful".into()
                 } else {
@@ -1155,6 +1226,8 @@ impl App {
                 self.status_is_error = false;
             }
             Err(e) => {
+                self.in_flight_screenshot = None;
+                self.in_flight_xml = None;
                 self.temp_screenshot = old_png;
                 self.temp_xml = old_xml;
                 if is_u2 {
@@ -1555,7 +1628,7 @@ impl eframe::App for App {
 
                 if let Some(mouse) = response.hover_pos() {
                     let img_pos = img_pos_from(mouse);
-                    let moved = self.last_hover_img_pos.map_or(true, |last| (img_pos - last).length() >= 5.0);
+                    let moved = self.last_hover_img_pos.is_none_or(|last| (img_pos - last).length() >= 5.0);
                     if moved && !response.dragged() {
                         self.hovered_path = self
                             .root_node
@@ -1567,7 +1640,7 @@ impl eframe::App for App {
                     }
 
                     if response.clicked() {
-                        let same_spot = self.click_pos.map_or(false, |last| (img_pos - last).length() < 10.0);
+                        let same_spot = self.click_pos.is_some_and(|last| (img_pos - last).length() < 10.0);
                         if same_spot {
                             if let Some(cur) = self.selected_path.clone() {
                                 if cur.len() > 1 {
