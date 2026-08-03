@@ -9,7 +9,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
 #[cfg(target_os = "windows")]
@@ -231,6 +231,11 @@ struct App {
     properties_width: f32,
     drag_start_img: Option<Pos2>,
     last_adb_check: Option<Instant>,
+    capturing: bool,
+    capture_rx: Option<mpsc::Receiver<CaptureResult>>,
+    pending_capture_method: Option<CaptureMethod>,
+    pending_old_screenshot: Option<PathBuf>,
+    pending_old_xml: Option<PathBuf>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -238,6 +243,8 @@ enum CaptureMethod {
     Adb,
     U2,
 }
+
+type CaptureResult = Result<(PathBuf, PathBuf), String>;
 
 impl Default for App {
     fn default() -> Self {
@@ -273,16 +280,27 @@ impl Default for App {
             properties_width: 350.0,
             drag_start_img: None,
             last_adb_check: None,
+            capturing: false,
+            capture_rx: None,
+            pending_capture_method: None,
+            pending_old_screenshot: None,
+            pending_old_xml: None,
         }
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        if let Some(p) = self.temp_screenshot.take() {
+        for p in [self.temp_screenshot.take(), self.pending_old_screenshot.take()]
+            .into_iter()
+            .flatten()
+        {
             let _ = std::fs::remove_file(&p);
         }
-        if let Some(p) = self.temp_xml.take() {
+        for p in [self.temp_xml.take(), self.pending_old_xml.take()]
+            .into_iter()
+            .flatten()
+        {
             let _ = std::fs::remove_file(&p);
         }
     }
@@ -975,7 +993,10 @@ impl App {
         }
     }
 
-    fn load_from_u2(&mut self, ctx: &egui::Context) {
+    fn start_capture(&mut self, ctx: &egui::Context, method: CaptureMethod) {
+        if self.capturing {
+            return;
+        }
         let serial = match self.selected_device.clone() {
             Some(s) => s,
             None => {
@@ -985,62 +1006,86 @@ impl App {
             }
         };
 
-        let old_png = self.temp_screenshot.take();
-        let old_xml = self.temp_xml.take();
-
-        match uiautomator2_capture(&serial, self.display_id) {
-            Ok((png, xml)) => {
-                self.load_screenshot(&png, ctx);
-                self.load_xml(&xml, ctx);
-                self.tree_display_id = self.display_id;
-                self.last_tree_display_id = self.tree_display_id;
-                self.temp_screenshot = Some(png);
-                self.temp_xml = Some(xml);
-                self.status_message = Some("uiautomator2 capture successful".into());
-                self.status_is_error = false;
-            }
-            Err(e) => {
-                self.temp_screenshot = old_png;
-                self.temp_xml = old_xml;
-                U2_STARTED.store(false, Ordering::Relaxed);
-                self.status_message = Some(format!("u2 capture failed: {e}"));
-                self.status_is_error = true;
-            }
-        }
-    }
-
-    fn adb_capture_and_load(&mut self, ctx: &egui::Context) {
-        let serial = match self.selected_device.clone() {
-            Some(s) => s,
-            None => {
-                self.status_message = Some("No device selected — connect a device and ensure it appears in the dropdown".into());
-                self.status_is_error = true;
-                return;
-            }
-        };
-
-        if U2_STARTED.load(Ordering::Relaxed) {
-            let _ = adb()
-                .args(["-s", &serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
-                .output();
-            let _ = adb()
-                .args(["-s", &serial, "shell", "am force-stop com.github.uiautomator"])
-                .output();
-            U2_STARTED.store(false, Ordering::Relaxed);
-        }
-
+        self.capturing = true;
         self.status_message = Some("Capturing...".into());
         self.status_is_error = false;
 
+        // Take old temp paths out of tracking so load_screenshot/load_xml won't
+        // delete the freshly-captured files (temp paths are deterministic/reused).
         let old_png = self.temp_screenshot.take();
         let old_xml = self.temp_xml.take();
 
+        let display_id = self.display_id;
         let phys_id = self.available_displays.iter()
-            .find(|(log, _)| *log == self.display_id)
+            .find(|(log, _)| *log == display_id)
             .map(|(_, phys)| *phys)
             .unwrap_or(0);
+        let u2_started = U2_STARTED.load(Ordering::Relaxed);
 
-        match adb_capture(&serial, self.display_id, phys_id) {
+        let (tx, rx) = mpsc::channel();
+        self.capture_rx = Some(rx);
+        self.pending_capture_method = Some(method.clone());
+        self.pending_old_screenshot = old_png;
+        self.pending_old_xml = old_xml;
+
+        let thread_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = match method {
+                CaptureMethod::Adb => {
+                    if u2_started {
+                        let _ = adb()
+                            .args(["-s", &serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
+                            .output();
+                        let _ = adb()
+                            .args(["-s", &serial, "shell", "am force-stop com.github.uiautomator"])
+                            .output();
+                        U2_STARTED.store(false, Ordering::Relaxed);
+                    }
+                    adb_capture(&serial, display_id, phys_id)
+                }
+                CaptureMethod::U2 => uiautomator2_capture(&serial, display_id),
+            };
+            match tx.send(result) {
+                Ok(_) => thread_ctx.request_repaint(),
+                Err(mpsc::SendError(result)) => {
+                    // Receiver dropped (app exited mid-capture): the fresh temps
+                    // were disarmed from this thread's TempGuard, so remove them
+                    // here to avoid leaving orphan files in the temp dir.
+                    if let Ok((png, xml)) = result {
+                        let _ = std::fs::remove_file(&png);
+                        let _ = std::fs::remove_file(&xml);
+                    }
+                }
+            }
+        });
+    }
+
+    fn poll_capture(&mut self, ctx: &egui::Context) {
+        let result = match self.capture_rx.as_ref() {
+            None => return,
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.capture_rx = None;
+                    self.capturing = false;
+                    self.pending_capture_method = None;
+                    self.temp_screenshot = self.pending_old_screenshot.take();
+                    self.temp_xml = self.pending_old_xml.take();
+                    self.status_message = Some("capture failed: background thread ended unexpectedly".into());
+                    self.status_is_error = true;
+                    return;
+                }
+            },
+        };
+
+        self.capture_rx = None;
+        self.capturing = false;
+        let is_u2 = self.pending_capture_method.take() == Some(CaptureMethod::U2);
+        let old_png = self.pending_old_screenshot.take();
+        let old_xml = self.pending_old_xml.take();
+
+        match result {
             Ok((png, xml)) => {
                 self.load_screenshot(&png, ctx);
                 self.load_xml(&xml, ctx);
@@ -1048,13 +1093,23 @@ impl App {
                 self.last_tree_display_id = self.tree_display_id;
                 self.temp_screenshot = Some(png);
                 self.temp_xml = Some(xml);
-                self.status_message = Some("ADB capture successful".into());
+                self.status_message = Some(if is_u2 {
+                    "uiautomator2 capture successful".into()
+                } else {
+                    "ADB capture successful".into()
+                });
                 self.status_is_error = false;
             }
             Err(e) => {
                 self.temp_screenshot = old_png;
                 self.temp_xml = old_xml;
-                self.status_message = Some(format!("ADB capture failed: {e}"));
+                if is_u2 {
+                    U2_STARTED.store(false, Ordering::Relaxed);
+                }
+                self.status_message = Some(format!(
+                    "{} capture failed: {e}",
+                    if is_u2 { "u2" } else { "ADB" }
+                ));
                 self.status_is_error = true;
             }
         }
@@ -1064,7 +1119,10 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.refresh_devices();
+        if !self.capturing {
+            self.refresh_devices();
+        }
+        self.poll_capture(&ctx);
 
         // Handle double-click tap — two-phase: tap now, capture after settle
         if let Some((x, y)) = self.pending_tap.take() {
@@ -1096,8 +1154,8 @@ impl eframe::App for App {
             if tap_start.elapsed() >= std::time::Duration::from_millis(800) {
                 self.tap_settle_start = None;
                 match self.last_capture {
-                    Some(CaptureMethod::Adb) => self.adb_capture_and_load(&ctx),
-                    Some(CaptureMethod::U2) | None => self.load_from_u2(&ctx),
+                    Some(CaptureMethod::Adb) => self.start_capture(&ctx, CaptureMethod::Adb),
+                    Some(CaptureMethod::U2) | None => self.start_capture(&ctx, CaptureMethod::U2),
                 }
             } else {
                 ctx.request_repaint();
@@ -1161,42 +1219,46 @@ impl eframe::App for App {
                     self.refresh_devices();
                 }
                 if !self.adb_devices.is_empty() {
-                    let current = self.selected_device.as_deref().unwrap_or("");
-                    egui::ComboBox::from_id_salt("device_selector")
-                        .selected_text(current)
-                        .width(160.0)
-                        .show_ui(ui, |ui| {
-                            for serial in &self.adb_devices {
-                                ui.selectable_value(
-                                    &mut self.selected_device,
-                                    Some(serial.clone()),
-                                    serial,
-                                );
-                            }
-                        });
+                    let current = self.selected_device.clone().unwrap_or_default();
+                    ui.add_enabled_ui(!self.capturing, |ui| {
+                        egui::ComboBox::from_id_salt("device_selector")
+                            .selected_text(current.as_str())
+                            .width(160.0)
+                            .show_ui(ui, |ui| {
+                                for serial in &self.adb_devices {
+                                    ui.selectable_value(
+                                        &mut self.selected_device,
+                                        Some(serial.clone()),
+                                        serial,
+                                    );
+                                }
+                            });
+                    });
                 }
                 if !self.adb_devices.is_empty() {
                     let current_disp = format!("Disp {}", self.display_id);
-                    egui::ComboBox::from_id_salt("display_selector")
-                        .selected_text(&current_disp)
-                        .width(70.0)
-                        .show_ui(ui, |ui| {
-                            for &(log, _phys) in &self.available_displays {
-                                let label = format!("Disp {log}");
-                                ui.selectable_value(&mut self.display_id, log, label);
-                            }
-                        });
+                    ui.add_enabled_ui(!self.capturing, |ui| {
+                        egui::ComboBox::from_id_salt("display_selector")
+                            .selected_text(&current_disp)
+                            .width(70.0)
+                            .show_ui(ui, |ui| {
+                                for &(log, _phys) in &self.available_displays {
+                                    let label = format!("Disp {log}");
+                                    ui.selectable_value(&mut self.display_id, log, label);
+                                }
+                            });
+                    });
                 }
                 ui.separator();
-                if ui.button("📱 ADB Capture").clicked() {
+                if ui.add_enabled(!self.capturing, egui::Button::new("📱 ADB Capture")).clicked() {
                     self.last_capture = Some(CaptureMethod::Adb);
-                    self.adb_capture_and_load(&ctx);
+                    self.start_capture(&ctx, CaptureMethod::Adb);
                 }
-                if ui.button("⚡ u2 Capture").clicked() {
+                if ui.add_enabled(!self.capturing, egui::Button::new("⚡ u2 Capture")).clicked() {
                     self.last_capture = Some(CaptureMethod::U2);
-                    self.load_from_u2(&ctx);
+                    self.start_capture(&ctx, CaptureMethod::U2);
                 }
-                if ui.button("💾 Save").clicked() {
+                if ui.add_enabled(!self.capturing, egui::Button::new("💾 Save")).clicked() {
                     self.save_files();
                 }
                 ui.separator();
