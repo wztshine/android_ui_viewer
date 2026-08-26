@@ -2,11 +2,9 @@
 
 A Rust desktop application for inspecting Android UI layouts from uiautomator XML dumps.
 Built with [egui](https://github.com/emilk/egui) (immediate-mode GUI).
-Single file (~1753 lines) located at `src/main.rs`.
 
 一款 Rust 桌面工具，从 uiautomator XML dump 中检查 Android UI 布局。
 基于 [egui](https://github.com/emilk/egui)（即时模式 GUI）构建。
-单一文件（约 1753 行），位于 `src/main.rs`。
 
 ## Features / 功能
 
@@ -20,8 +18,8 @@ Single file (~1753 lines) located at `src/main.rs`.
   **属性检查** — 查看 class、text、resource-id、content-desc 及所有 XML 属性
 - **ADB capture** — one-click screenshot + uiautomator dump from a connected device  
   **ADB 捕获** — 一键截屏 + uiautomator dump
-- **U2 capture** — capture via atx-agent JSON-RPC (screenshot + hierarchy dump)  
-  **U2 捕获** — 通过 atx-agent JSON-RPC 捕获（截图 + 层级 dump）
+- **U2 capture** — capture via uiautomator2 (u2.jar JSON-RPC)  
+  **U2 捕获** — 通过 uiautomator2（u2.jar JSON-RPC）捕获
 - **Double-click tap** — double-click on image to send `input tap` and auto-refresh  
   **双击触控** — 双击图片发送 `input tap` 并自动刷新
 - **Drag swipe** — drag on image to send `input swipe` and auto-refresh (10px threshold)  
@@ -55,8 +53,8 @@ cargo run
    点击 `Load Screenshot` 和 `Load XML` 选择文件（自动配对同目录文件）
 2. **ADB Capture** — connect a device via USB, select it from the dropdown, click `ADB`  
    通过 USB 连接设备，从下拉菜单选择，点击 `ADB`
-3. **U2 Capture** — connect a device with atx-agent installed, click `U2`  
-   连接已安装 atx-agent 的设备，点击 `U2`
+3. **U2 Capture** — connect a device with u2.jar installed, click `U2`  
+   连接已安装 u2.jar 的设备，点击 `U2`
 4. **Multi-display / 多显示设备** — toolbar combo box sets capture display; properties panel combo box filters tree  
    工具栏选择器设置捕获显示；属性面板选择器过滤树状视图
 5. **Inspect / 检查** — hover to highlight; click to select (same spot cycles ancestors)  
@@ -87,7 +85,7 @@ The app also works completely offline with pre-captured files — no device need
 - ADB installed and in PATH / ADB 已安装并在 PATH 中
 - OpenGL 3.2+ (or Vulkan/DirectX 12 via wgpu) for rendering / OpenGL 3.2+（或通过 wgpu 使用 Vulkan/DirectX 12）用于渲染
 - Android device with USB debugging enabled / 开启 USB 调试的 Android 设备
-- **For U2**: [atx-agent](https://github.com/openatx/atx-agent) on device (`python -m uiautomator2 init`)
+- **For U2**: u2.jar on device, installed via `python -m uiautomator2 init`
 
 > **Note / 注意**: Multi-display support is code-complete but has not been tested on actual multi-display devices.
 > 多显示设备支持已实现但未在实际多显示设备上测试。
@@ -109,8 +107,8 @@ On Windows, every ADB subprocess (e.g. `adb devices`, `screencap`, `pull`) previ
 在 Windows 上，每次执行 ADB 子进程（如 `adb devices`、`screencap`、`pull`）原本会闪烁一个控制台窗口。现在所有 ADB 调用都通过 `adb()` 辅助函数，带有 `CREATE_NO_WINDOW` 标志来抑制此现象。
 
 **Device refresh / 设备刷新:**  
-The toolbar's 🔄 button forces a refresh of the device list and display IDs. The list also auto-refreshes every 15 seconds while the app is running. Refreshes run on a background thread, so the UI never blocks while querying adb.  
-工具栏的 🔄 按钮可强制刷新设备列表和显示 ID。列表在运行期间也会每 15 秒自动刷新一次。刷新在后台线程执行，查询 adb 时 UI 不会卡顿。
+The toolbar's 🔄 button forces a refresh of the device list and display IDs. The list also auto-refreshes every 15 seconds while the app is running. Refreshes run on a background thread, so the UI never blocks while querying adb. A refresh that hangs is abandoned after 15 seconds (`REFRESH_TIMEOUT`) so the device list can't stay permanently frozen.  
+工具栏的 🔄 按钮可强制刷新设备列表和显示 ID。列表在运行期间也会每 15 秒自动刷新一次。刷新在后台线程执行，查询 adb 时 UI 不会卡顿。挂起的刷新会在 15 秒（`REFRESH_TIMEOUT`）后被放弃，设备列表不会永久卡死。
 
 **Background capture / 后台捕获:**  
 Captures (ADB/U2) run on a background thread, keeping the UI responsive. A capture that hangs is abandoned after 30 seconds (`CAPTURE_TIMEOUT`) and the previous view is restored.  

@@ -8,7 +8,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
@@ -18,20 +18,36 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-static U2_STARTED: AtomicBool = AtomicBool::new(false);
-static U2_SERIAL: Mutex<Option<String>> = Mutex::new(None);
+static U2V3_SERIAL: Mutex<Option<String>> = Mutex::new(None);
+static U2V3_PROCESS: Mutex<Option<(u64, std::process::Child)>> = Mutex::new(None);
+static U2V3_SERVER_ID: AtomicU64 = AtomicU64::new(0);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn next_temp_id() -> u64 {
     TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-const U2_ADDR: &str = "127.0.0.1:7912";
-const U2_FORWARD: &str = "tcp:7912";
-const ATX_AGENT: &str = "/data/local/tmp/atx-agent";
-const UIAUTOMATOR_APK: &str = "/data/local/tmp/app-uiautomator.apk";
+const U2V3_ADDR: &str = "127.0.0.1:9008";
+const U2V3_FORWARD: &str = "tcp:9008";
+const U2V3_JAR: &str = "/data/local/tmp/u2.jar";
+const U2V3_PORT: &str = "9008";
 const DEVICE_DUMP: &str = "/sdcard/uiviewer_dump.xml";
 const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const REFRESH_ADB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+// HTTP read timeout for JSON-RPC calls (takeScreenshot can take seconds).
+const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// Short read timeout for /ping probes: a single hung probe must not exceed the
+// launch deadline, which is only checked between attempts.
+const U2V3_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+// JSON-RPC params: takeScreenshot(display_id, quality) — numeric display id,
+// 0 = primary; returns base64 JPEG. dumpWindowHierarchy(compressed, max_depth)
+// mirrors uiautomator2's dump_hierarchy(compressed=False, max_depth=50).
+const U2V3_PRIMARY_DISPLAY_ID: i32 = 0;
+const U2V3_SCREENSHOT_QUALITY: i32 = 80;
+const U2V3_DUMP_COMPRESSED: bool = false;
+const U2V3_DUMP_MAX_DEPTH: i32 = 50;
 
 struct TempGuard {
     files: Vec<PathBuf>,
@@ -245,19 +261,19 @@ struct App {
     last_adb_check: Option<Instant>,
     capturing: bool,
     capture_start: Option<Instant>,
-    capture_rx: Option<mpsc::Receiver<CaptureResult>>,
-    pending_capture_method: Option<CaptureMethod>,
+    capture_rx: Option<mpsc::Receiver<(CaptureMethod, CaptureResult)>>,
     pending_old_screenshot: Option<PathBuf>,
     pending_old_xml: Option<PathBuf>,
     in_flight_screenshot: Option<PathBuf>,
     in_flight_xml: Option<PathBuf>,
     refresh_rx: Option<mpsc::Receiver<DeviceRefresh>>,
+    refresh_start: Option<Instant>,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum CaptureMethod {
     Adb,
-    U2,
+    U2V3,
 }
 
 type CaptureResult = Result<(PathBuf, PathBuf), String>;
@@ -305,12 +321,12 @@ impl Default for App {
             capturing: false,
             capture_start: None,
             capture_rx: None,
-            pending_capture_method: None,
             pending_old_screenshot: None,
             pending_old_xml: None,
             in_flight_screenshot: None,
             in_flight_xml: None,
             refresh_rx: None,
+            refresh_start: None,
         }
     }
 }
@@ -460,8 +476,10 @@ fn parse_windows_xml(text: &str, display_id: u32) -> Option<UiNode> {
 }
 
 fn load_texture(path: &Path, ctx: &egui::Context) -> Result<(TextureHandle, Vec2), String> {
-    let img = image::ImageReader::open(path)
-        .map_err(|e| format!("open image: {e}"))?
+    let file = std::fs::File::open(path).map_err(|e| format!("open image: {e}"))?;
+    let img = image::ImageReader::new(std::io::BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|e| format!("guess image format: {e}"))?
         .decode()
         .map_err(|e| format!("decode image: {e}"))?;
     let size = Vec2::new(img.width() as f32, img.height() as f32);
@@ -503,10 +521,12 @@ fn get_display_ids_from_xml(text: &str) -> Vec<u32> {
     Vec::new()
 }
 
-fn adb_capture(serial: &str, display_physical: u64, png: PathBuf, xml: PathBuf) -> Result<(PathBuf, PathBuf), String> {
+fn adb_capture(serial: &str, display_id: u32, display_physical: u64, png: PathBuf, xml: PathBuf) -> Result<(PathBuf, PathBuf), String> {
     let mut tmp_guard = TempGuard::new();
 
-    let img = if display_physical > 0 {
+    // The physical display id is a large opaque token for every display (primary
+    // included), so "secondary" is detected via the logical id, not physical.
+    let img = if display_id > 0 {
         let phys_str = display_physical.to_string();
         adb()
             .args(["-s", serial, "exec-out", "screencap", "-p", "-d", &phys_str])
@@ -566,13 +586,60 @@ fn adb_capture(serial: &str, display_physical: u64, png: PathBuf, xml: PathBuf) 
     Ok((png, xml))
 }
 
+// Run an adb command with a hard deadline: stdout is redirected to a temp file
+// (so a large output can't deadlock on the pipe buffer), and if the child hasn't
+// exited by the deadline it is killed. Returns None on timeout/failure. Used by
+// the device-refresh path so a wedged adb can't leak a permanently hung thread.
+fn adb_output_bounded(args: &[&str], timeout: std::time::Duration) -> Option<std::process::Output> {
+    let tmp = std::env::temp_dir().join(format!("uiviewer_adb_{}.out", next_temp_id()));
+    let file = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+    let mut child = match adb()
+        .args(args)
+        .stdout(std::process::Stdio::from(file))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+    };
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_file(&tmp);
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = std::fs::remove_file(&tmp);
+                return None;
+            }
+        }
+    };
+    let stdout = std::fs::read(&tmp).unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
+    Some(std::process::Output { status, stdout, stderr: Vec::new() })
+}
+
 fn get_displays(serial: &str) -> Vec<(u32, u64)> {
     // Get physical display IDs from SurfaceFlinger
-    let physical_output = adb()
-        .args(["-s", serial, "shell", "dumpsys", "SurfaceFlinger", "--display-id"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success());
+    let physical_output = adb_output_bounded(
+        &["-s", serial, "shell", "dumpsys", "SurfaceFlinger", "--display-id"],
+        REFRESH_ADB_TIMEOUT,
+    )
+    .filter(|o| o.status.success());
     let mut logical_to_physical: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     if let Some(output) = physical_output {
         let text = String::from_utf8_lossy(&output.stdout);
@@ -596,11 +663,11 @@ fn get_displays(serial: &str) -> Vec<(u32, u64)> {
     }
 
     // Get logical display IDs from dumpsys display
-    let logical_output = adb()
-        .args(["-s", serial, "shell", "dumpsys", "display"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success());
+    let logical_output = adb_output_bounded(
+        &["-s", serial, "shell", "dumpsys", "display"],
+        REFRESH_ADB_TIMEOUT,
+    )
+    .filter(|o| o.status.success());
     let mut logical_ids: Vec<u32> = if let Some(output) = logical_output {
         let text = String::from_utf8_lossy(&output.stdout);
         text.lines()
@@ -627,37 +694,67 @@ fn get_displays(serial: &str) -> Vec<(u32, u64)> {
     }).collect()
 }
 
-fn fetch_device_refresh(current_serial: Option<String>) -> DeviceRefresh {
+fn fetch_device_refresh(current_serial: Option<String>, current_devices: Vec<String>) -> DeviceRefresh {
     let mut devices = Vec::new();
-    if let Ok(out) = adb().args(["devices"]).output() {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines().skip(1) {
-            if let Some(serial) = line.split('\t').next() {
-                if !serial.is_empty() && line.contains("\tdevice") {
-                    devices.push(serial.to_string());
+    // On timeout/failure keep the current device list instead of clearing it,
+    // so a transient adb hiccup doesn't wipe the dropdown selection.
+    let devices_ok = match adb_output_bounded(&["devices"], REFRESH_ADB_TIMEOUT) {
+        Some(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines().skip(1) {
+                if let Some(serial) = line.split('\t').next() {
+                    if !serial.is_empty() && line.contains("\tdevice") {
+                        devices.push(serial.to_string());
+                    }
                 }
             }
+            true
         }
-    }
+        // Timeout or non-zero exit: keep the current list rather than clearing it.
+        _ => false,
+    };
     let target = current_serial
         .as_ref()
         .filter(|s| devices.iter().any(|d| d == *s))
         .cloned()
         .or_else(|| devices.first().cloned());
-    let displays = target.as_deref().map(get_displays);
-    DeviceRefresh { devices, selected: target, displays }
+    let displays = if devices_ok {
+        target.as_deref().map(get_displays)
+    } else {
+        None
+    };
+    DeviceRefresh {
+        devices: if devices_ok { devices } else { current_devices },
+        selected: target,
+        displays,
+    }
 }
 
-fn http_get(path: &str) -> Result<Vec<u8>, String> {
-    let mut stream =
-        TcpStream::connect(U2_ADDR).map_err(|e| format!("connect: {e}"))?;
+fn http_request(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    read_timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
+    // Bound reads so a silent peer cannot hang the background capture thread
+    // indefinitely (the UI-side CAPTURE_TIMEOUT only abandons the wait).
+    let _ = stream.set_read_timeout(Some(read_timeout));
 
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {U2_ADDR}\r\nConnection: close\r\n\r\n"
-    );
+    let head = match body {
+        Some(b) => format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            b.len()
+        ),
+        None => format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    };
     stream
-        .write_all(request.as_bytes())
+        .write_all(head.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
+    if let Some(b) = body {
+        stream.write_all(b).map_err(|e| format!("write body: {e}"))?;
+    }
 
     let mut reader = std::io::BufReader::new(&mut stream);
     // Read status line
@@ -705,6 +802,26 @@ fn http_get(path: &str) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
+fn http_jsonrpc(method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+    let body = serde_json::to_vec(&payload).map_err(|e| format!("json encode: {e}"))?;
+    let raw = http_request(U2V3_ADDR, "POST", "/jsonrpc/0", Some(&body), HTTP_READ_TIMEOUT)?;
+    let data: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|e| format!("json decode: {e}"))?;
+    if let Some(err) = data.get("error") {
+        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+        return Err(format!("{method}: {msg}"));
+    }
+    data.get("result")
+        .cloned()
+        .ok_or_else(|| format!("{method}: missing result"))
+}
+
 fn read_chunked(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     loop {
@@ -729,171 +846,177 @@ fn read_chunked(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
-fn extract_xml(raw: &[u8]) -> Vec<u8> {
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) {
-        if let Some(s) = v.get("result").and_then(|v| v.as_str()) {
-            return s.as_bytes().to_vec();
+fn stop_u2v3() {
+    // Killing the adb client closes the streaming shell, which terminates
+    // the remote app_process (mirrors Python's MockAdbProcess.kill()).
+    if let Ok(mut guard) = U2V3_PROCESS.lock() {
+        if let Some((_, mut child)) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
-    raw.to_vec()
 }
 
-fn pidof_atx_agent(serial: &str) -> bool {
-    adb()
-        .args(["-s", serial, "shell", "pidof", "atx-agent"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.split_whitespace().next()?.parse::<u32>().ok()
-        })
-        .is_some()
+// Only stops the u2.jar server if the stored child is still the one owned by
+// `id`. A capture thread abandoned by the UI timeout (zombie) shares the global
+// U2V3_PROCESS slot with a newer capture; without this check its failure path
+// could kill the newer capture's freshly started server.
+fn stop_u2v3_if_current(id: u64) {
+    if let Ok(mut guard) = U2V3_PROCESS.lock() {
+        if guard.as_ref().map(|(cur, _)| *cur) == Some(id) {
+            if let Some((_, mut child)) = guard.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 }
 
-fn uiautomator2_capture(serial: &str, display_id: u32, png: PathBuf, xml: PathBuf) -> Result<(PathBuf, PathBuf), String> {
+fn launch_u2v3(serial: &str) -> Result<(), String> {
+    // Stop any previous uiautomator server process first.
+    stop_u2v3();
+    // Also clean up any orphaned server left by a previous run/exit. Match on the
+    // main class, not the jar path: the CLASSPATH is an environment variable, so
+    // `pkill -f u2.jar` never matches the app_process server's argv (verified).
+    let _ = adb()
+        .args(["-s", serial, "shell", "pkill -f com.wetest.uia2.Main 2>/dev/null; true"])
+        .output();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let cmd = format!(
+        "CLASSPATH={U2V3_JAR} app_process / com.wetest.uia2.Main -p {U2V3_PORT}"
+    );
+    let mut child = adb()
+        .args(["-s", serial, "shell", &cmd])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn uiautomator: {e}"))?;
+    let my_id = U2V3_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut guard) = U2V3_PROCESS.lock() {
+        *guard = Some((my_id, child));
+    } else {
+        let _ = child.kill();
+        return Err("uiautomator process lock poisoned".into());
+    }
+
+    // Poll /ping until the server answers "pong" (trimmed: some servers append
+    // a trailing newline/whitespace to the body).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match http_request(U2V3_ADDR, "GET", "/ping", None, U2V3_PING_TIMEOUT) {
+            Ok(b) if std::str::from_utf8(&b).map(|s| s.trim()).unwrap_or("") == "pong" => return Ok(()),
+            _ => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    stop_u2v3_if_current(my_id);
+    Err(format!("{U2V3_JAR} failed to start — server did not answer /ping in 30s"))
+}
+
+fn uiautomator2_v3_capture(serial: &str, display_id: u32, display_physical: u64, png: PathBuf, xml: PathBuf) -> Result<(PathBuf, PathBuf), String> {
     let mut tmp_guard = TempGuard::new();
 
-    // Check if atx-agent is already running — if so, reuse it
-    if !U2_STARTED.load(Ordering::Relaxed) {
-        if !pidof_atx_agent(serial) {
-            // Check if binary exists first
-            let exists = adb()
-                .args(["-s", serial, "shell", "ls", ATX_AGENT])
-                .output()
-                .ok()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !exists {
-                return Err(format!("{ATX_AGENT} not found on device — run 'python -m uiautomator2 init' to install"));
-            }
-
-            let _ = adb()
-                .args(["-s", serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
-                .output();
-            // Kill stale uiautomator process so atx-agent starts fresh
-            let _ = adb()
-                .args(["-s", serial, "shell", "am force-stop com.github.uiautomator"])
-                .output();
-            // Start atx-agent server in daemon mode (-d is a flag of the server subcommand)
-            let start_output = adb()
-                .args(["-s", serial, "shell", ATX_AGENT, "server", "-d"])
-                .output();
-            if let Ok(ref out) = start_output {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                if !stderr.trim().is_empty() {
-                    eprintln!("atx-agent start stderr: {stderr}");
-                }
-            }
-
-            // Retry pidof check up to 5 times (total ~10s) for slow devices
-            let mut ok = false;
-            for i in 0..5 {
-                std::thread::sleep(std::time::Duration::from_millis(2000));
-                ok = pidof_atx_agent(serial);
-                if ok {
-                    eprintln!("atx-agent confirmed running after {}s", (i + 1) * 2);
-                    break;
-                }
-            }
-            if !ok {
-                return Err(format!(
-                    "{ATX_AGENT} failed to start after 10s — check device log for details"
-                ));
-            }
-        }
-        U2_STARTED.store(true, Ordering::Relaxed);
-        // Record serial early so exit cleanup can kill atx-agent/forward even if capture fails
-        if let Ok(mut guard) = U2_SERIAL.lock() {
-            *guard = Some(serial.to_string());
-        }
-    }
-
-    // Ensure uiautomator test APK is installed (check every time)
-    let pkgs = adb()
-        .args(["-s", serial, "shell", "pm", "list", "packages"])
+    // Require the u2.jar to be present (pushed via `python -m uiautomator2 init`).
+    let jar_exists = adb()
+        .args(["-s", serial, "shell", "ls", U2V3_JAR])
         .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    let apk_installed = pkgs.lines().any(|l| l.trim() == "package:com.github.uiautomator");
-    if !apk_installed {
-        let apk_file = adb()
-            .args(["-s", serial, "shell", "ls", UIAUTOMATOR_APK])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if apk_file {
-            let install = adb()
-                .args(["-s", serial, "shell", "pm", "install", "-r", UIAUTOMATOR_APK])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !install {
-                return Err("installing app-uiautomator.apk failed".into());
-            }
-            // Restart atx-agent so it detects the newly installed service
-            let _ = adb()
-                .args(["-s", serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
-                .output();
-            let _ = adb()
-                .args(["-s", serial, "shell", ATX_AGENT, "server", "-d"])
-                .output();
-            // Wait for atx-agent to restart (retry up to 5 times)
-            let mut restarted = false;
-            for _ in 0..5 {
-                std::thread::sleep(std::time::Duration::from_millis(2000));
-                if pidof_atx_agent(serial) {
-                    restarted = true;
-                    break;
-                }
-            }
-            if !restarted {
-                return Err(format!("{ATX_AGENT} failed to restart after APK install"));
-            }
-        }
-        // APK file not on device — proceed, screenshot may still work
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !jar_exists {
+        return Err(format!(
+            "{U2V3_JAR} not found on device — run 'python -m uiautomator2 init' to install"
+        ));
     }
 
-    // Remove stale forward first, then create fresh one
+    // Remove stale forward first, then create a fresh one.
     let _ = adb()
-        .args(["-s", serial, "forward", "--remove", U2_FORWARD])
+        .args(["-s", serial, "forward", "--remove", U2V3_FORWARD])
         .output();
     let status = adb()
-        .args(["-s", serial, "forward", U2_FORWARD, U2_FORWARD])
+        .args(["-s", serial, "forward", U2V3_FORWARD, U2V3_FORWARD])
         .output()
         .map_err(|e| format!("adb not found: {e}"))?;
     if !status.status.success() {
-        return Err(format!("adb forward ({U2_FORWARD}) failed — port may be in use"));
+        return Err(format!("adb forward ({U2V3_FORWARD}) failed — port may be in use"));
     }
 
-    // Screenshot: GET /screenshot/{id} → PNG (via atx-agent HTTP, ~12% faster than adb exec-out)
-    let screenshot_path = format!("/screenshot/{display_id}");
-    let png_bytes = {
-        let mut retries = 0;
-        let mut last_err;
-        loop {
-            match http_get(&screenshot_path) {
-                Ok(bytes) if bytes.starts_with(&[0x89, b'P', b'N', b'G']) => {
-                    break bytes;
+    // Start the uiautomator server (fresh each capture) and wait for /ping.
+    launch_u2v3(serial)?;
+
+    // Screenshot: primary display (logical id 0) via JSON-RPC takeScreenshot →
+    // base64 JPEG, with a fallback to ADB screencap when the server returns
+    // nothing (mirrors uiautomator2's `if base64_data:` fallback); secondary
+    // displays (logical id > 0) always use the ADB screencap path. The physical
+    // id is an opaque token for every display, so "secondary" is detected via
+    // the logical id.
+    let png_bytes = if display_id > 0 {
+        let phys_str = display_physical.to_string();
+        let out = adb()
+            .args(["-s", serial, "exec-out", "screencap", "-p", "-d", &phys_str])
+            .output()
+            .map_err(|e| format!("screencap failed: {e}"))?;
+        if !out.status.success() {
+            return Err("screencap returned error".into());
+        }
+        out.stdout
+    } else {
+        // Primary display: takeScreenshot(display_id, quality). The first param
+        // is a numeric display id (a path string is rejected by the server); 0
+        // is the primary display. Verified on-device: returns MIME-style base64
+        // JPEG with a newline every 76 chars — strip whitespace before decoding,
+        // and fall back to ADB screencap when the result is empty or undecodable.
+        use base64::Engine;
+        let decoded = http_jsonrpc(
+            "takeScreenshot",
+            &[U2V3_PRIMARY_DISPLAY_ID.into(), U2V3_SCREENSHOT_QUALITY.into()],
+        )
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .map(|b64: String| b64.chars().filter(|c| !c.is_whitespace()).collect::<String>())
+            .filter(|b64| !b64.is_empty())
+            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(&b64).ok());
+        match decoded {
+            Some(bytes) => bytes,
+            None => {
+                let out = adb()
+                    .args(["-s", serial, "exec-out", "screencap", "-p"])
+                    .output()
+                    .map_err(|e| format!("screencap failed: {e}"))?;
+                if !out.status.success() {
+                    return Err("screencap returned error".into());
                 }
-                Ok(_) => last_err = "not a PNG".into(),
-                Err(e) => last_err = e,
+                out.stdout
             }
-            retries += 1;
-            if retries >= 6 {
-                return Err(format!("screenshot: {last_err}"));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(800));
         }
     };
     tmp_guard.track(png.clone());
     std::fs::write(&png, &png_bytes).map_err(|e| format!("write png: {e}"))?;
 
-    // Hierarchy dump: GET /dump/hierarchy → JSON-wrapped XML
-    let raw = http_get("/dump/hierarchy")
-        .map_err(|e| format!("dump: {e}"))?;
-    let xml_bytes = extract_xml(&raw);
+    // Hierarchy dump: JSON-RPC dumpWindowHierarchy → plain XML string.
+    // Retry a few times when the dump comes back empty (the server sometimes
+    // returns an empty hierarchy right after launch).
+    let mut xml_bytes: Vec<u8> = Vec::new();
+    for _ in 0..3 {
+        let raw = http_jsonrpc(
+            "dumpWindowHierarchy",
+            &[U2V3_DUMP_COMPRESSED.into(), U2V3_DUMP_MAX_DEPTH.into()],
+        )
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.as_bytes().to_vec())
+                    .ok_or_else(|| "dumpWindowHierarchy: not a string".into())
+            })?;
+        if !raw.is_empty() {
+            xml_bytes = raw;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(800));
+    }
+    if xml_bytes.is_empty() {
+        return Err("dumpWindowHierarchy returned empty hierarchy".into());
+    }
     tmp_guard.track(xml.clone());
     std::fs::write(&xml, &xml_bytes).map_err(|e| format!("write xml: {e}"))?;
 
@@ -903,12 +1026,14 @@ fn uiautomator2_capture(serial: &str, display_id: u32, png: PathBuf, xml: PathBu
 
 impl App {
     fn load_screenshot(&mut self, path: &Path, ctx: &egui::Context) {
-        if let Some(p) = self.temp_screenshot.take() {
-            let _ = std::fs::remove_file(&p);
-        }
         let dir = path.parent().map(|p| p.to_path_buf());
         match load_texture(path, ctx) {
             Ok((tex, _size)) => {
+                // Only discard the previous capture's temp file once the new image
+                // actually loaded, so a failed load keeps the current screenshot usable.
+                if let Some(p) = self.temp_screenshot.take() {
+                    let _ = std::fs::remove_file(&p);
+                }
                 self.screenshot_texture = Some(tex);
                 self.screenshot_path = Some(path.to_path_buf());
             }
@@ -927,12 +1052,14 @@ impl App {
     }
 
     fn load_xml(&mut self, path: &Path, ctx: &egui::Context) {
-        if let Some(p) = self.temp_xml.take() {
-            let _ = std::fs::remove_file(&p);
-        }
         let dir = path.parent().map(|p| p.to_path_buf());
         match std::fs::read_to_string(path) {
             Ok(content) => {
+                // Only discard the previous capture's temp file once the new XML
+                // actually loaded, so a failed load keeps the current XML usable.
+                if let Some(p) = self.temp_xml.take() {
+                    let _ = std::fs::remove_file(&p);
+                }
                 // Detect multi-display format: <displays>, or <hierarchy> with <display> children
                 self.file_displays = get_display_ids_from_xml(&content);
                 if !self.file_displays.is_empty() {
@@ -1003,7 +1130,19 @@ impl App {
             let out_png = dir.join(stem).with_extension("png");
             let out_xml = dir.join(stem).with_extension("xml");
 
-            let ok_png = std::fs::copy(&screenshot, &out_png).is_ok();
+            // Re-encode the screenshot as PNG so the saved file matches its
+            // extension even when the source is a JPEG (user-loaded or U2V3).
+            let png_result = (|| -> Result<(), String> {
+                let file = std::fs::File::open(&screenshot)
+                    .map_err(|e| format!("open screenshot: {e}"))?;
+                let img = image::ImageReader::new(std::io::BufReader::new(file))
+                    .with_guessed_format()
+                    .map_err(|e| format!("guess screenshot format: {e}"))?
+                    .decode()
+                    .map_err(|e| format!("decode screenshot: {e}"))?;
+                img.save(&out_png).map_err(|e| format!("encode png: {e}"))
+            })();
+            let ok_png = png_result.is_ok();
             let ok_xml = std::fs::copy(&xml, &out_xml).is_ok();
             if ok_png && ok_xml {
                 let name = stem.to_string_lossy();
@@ -1026,22 +1165,25 @@ impl App {
         }
         self.last_adb_check = Some(now);
         let current = self.selected_device.clone();
+        let current_devices = self.adb_devices.clone();
         let (tx, rx) = mpsc::channel();
         let thread_ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = fetch_device_refresh(current);
+            let result = fetch_device_refresh(current, current_devices);
             if tx.send(result).is_ok() {
                 thread_ctx.request_repaint();
             }
         });
         self.refresh_rx = Some(rx);
+        self.refresh_start = Some(now);
     }
 
-    fn poll_device_refresh(&mut self) {
+    fn poll_device_refresh(&mut self, ctx: &egui::Context) {
         let outcome = self.refresh_rx.as_ref().map(|rx| rx.try_recv());
         match outcome {
             Some(Ok(result)) => {
                 self.refresh_rx = None;
+                self.refresh_start = None;
                 self.adb_devices = result.devices;
                 if !self.adb_devices.contains(&self.selected_device.as_deref().unwrap_or_default().to_string()) {
                     self.selected_device = self.adb_devices.first().cloned();
@@ -1057,9 +1199,23 @@ impl App {
                     }
                 }
             }
-            Some(Err(mpsc::TryRecvError::Empty)) => {}
+            Some(Err(mpsc::TryRecvError::Empty)) => {
+                if let Some(start) = self.refresh_start {
+                    if start.elapsed() >= REFRESH_TIMEOUT {
+                        // Abandon the hung refresh so it can't block future ones forever.
+                        self.refresh_rx = None;
+                        self.refresh_start = None;
+                        self.status_message =
+                            Some("device refresh timed out — adb not responding".into());
+                        self.status_is_error = true;
+                    } else {
+                        ctx.request_repaint_after(REFRESH_TIMEOUT - start.elapsed());
+                    }
+                }
+            }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.refresh_rx = None;
+                self.refresh_start = None;
             }
             None => {}
         }
@@ -1093,7 +1249,6 @@ impl App {
             .find(|(log, _)| *log == display_id)
             .map(|(_, phys)| *phys)
             .unwrap_or(0);
-        let u2_started = U2_STARTED.load(Ordering::Relaxed);
 
         // Generate unique temp paths here (main thread) so App::drop can clean
         // up even when the capture thread is still running at exit.
@@ -1104,40 +1259,41 @@ impl App {
                 tmp.join(format!("uiviewer_adb_screenshot_{id}.png")),
                 tmp.join(format!("uiviewer_adb_dump_{id}.xml")),
             ),
-            CaptureMethod::U2 => (
-                tmp.join(format!("uiviewer_u2_screenshot_{id}.png")),
-                tmp.join(format!("uiviewer_u2_dump_{id}.xml")),
+            CaptureMethod::U2V3 => (
+                tmp.join(format!("uiviewer_u2v3_screenshot_{id}.png")),
+                tmp.join(format!("uiviewer_u2v3_dump_{id}.xml")),
             ),
         };
         self.in_flight_screenshot = Some(png.clone());
         self.in_flight_xml = Some(xml.clone());
 
         let (tx, rx) = mpsc::channel();
+        // Record the serial on the main thread so exit cleanup can still find it
+        // if the app closes while the capture thread is starting up.
+        if method == CaptureMethod::U2V3 {
+            if let Ok(mut guard) = U2V3_SERIAL.lock() {
+                *guard = Some(serial.clone());
+            }
+        }
+
         self.capture_rx = Some(rx);
-        self.pending_capture_method = Some(method.clone());
         self.pending_old_screenshot = old_png;
         self.pending_old_xml = old_xml;
 
         let thread_ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = match method {
-                CaptureMethod::Adb => {
-                    if u2_started {
-                        let _ = adb()
-                            .args(["-s", &serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
-                            .output();
-                        let _ = adb()
-                            .args(["-s", &serial, "shell", "am force-stop com.github.uiautomator"])
-                            .output();
-                        U2_STARTED.store(false, Ordering::Relaxed);
-                    }
-                    adb_capture(&serial, phys_id, png.clone(), xml.clone())
+            let (method, result) = match method {
+                CaptureMethod::U2V3 => {
+                    (CaptureMethod::U2V3, uiautomator2_v3_capture(&serial, display_id, phys_id, png, xml))
                 }
-                CaptureMethod::U2 => uiautomator2_capture(&serial, display_id, png, xml),
+                CaptureMethod::Adb => {
+                    stop_u2v3();
+                    (CaptureMethod::Adb, adb_capture(&serial, display_id, phys_id, png.clone(), xml.clone()))
+                }
             };
-            match tx.send(result) {
+            match tx.send((method, result)) {
                 Ok(_) => thread_ctx.request_repaint(),
-                Err(mpsc::SendError(result)) => {
+                Err(mpsc::SendError((_, result))) => {
                     // Receiver dropped (app exited mid-capture): the fresh temps
                     // were disarmed from this thread's TempGuard, so remove them
                     // here to avoid leaving orphan files in the temp dir.
@@ -1151,21 +1307,23 @@ impl App {
     }
 
     fn poll_capture(&mut self, ctx: &egui::Context) {
-        let result = match self.capture_rx.as_ref() {
+        let (method, result) = match self.capture_rx.as_ref() {
             None => return,
             Some(rx) => match rx.try_recv() {
-                Ok(r) => r,
+                Ok((m, r)) => (m, r),
                 Err(mpsc::TryRecvError::Empty) => {
                     if let Some(start) = self.capture_start {
                         let elapsed = start.elapsed();
                         if elapsed >= CAPTURE_TIMEOUT {
                             // Abandon the hung capture: dropping the receiver makes the
                             // thread's eventual send fail, so it removes its own fresh
-                            // temp files (see SendError arm in start_capture).
+                            // temp files (see SendError arm in start_capture). Also kill
+                            // the u2.jar server so a zombie U2V3 thread's in-flight HTTP
+                            // calls fail fast instead of hitting a newer capture's server.
+                            stop_u2v3();
                             self.capture_rx = None;
                             self.capturing = false;
                             self.capture_start = None;
-                            self.pending_capture_method = None;
                             self.temp_screenshot = self.pending_old_screenshot.take();
                             self.temp_xml = self.pending_old_xml.take();
                             self.status_message = Some("capture timed out — device not responding".into());
@@ -1179,10 +1337,12 @@ impl App {
                     return;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    // Thread ended without sending (e.g. panic): kill any orphaned
+                    // u2.jar server left behind by a U2V3 capture thread.
+                    stop_u2v3();
                     self.capture_rx = None;
                     self.capturing = false;
                     self.capture_start = None;
-                    self.pending_capture_method = None;
                     self.in_flight_screenshot = None;
                     self.in_flight_xml = None;
                     self.temp_screenshot = self.pending_old_screenshot.take();
@@ -1197,9 +1357,12 @@ impl App {
         self.capture_rx = None;
         self.capturing = false;
         self.capture_start = None;
-        let is_u2 = self.pending_capture_method.take() == Some(CaptureMethod::U2);
         let old_png = self.pending_old_screenshot.take();
         let old_xml = self.pending_old_xml.take();
+        let label = match method {
+            CaptureMethod::Adb => "ADB",
+            CaptureMethod::U2V3 => "u2 v3",
+        };
 
         match result {
             Ok((png, xml)) => {
@@ -1212,16 +1375,17 @@ impl App {
                 }
                 self.load_screenshot(&png, ctx);
                 self.load_xml(&xml, ctx);
+                // Deliberately leave last_tree_display_id stale: when the dump covers
+                // multiple displays, ui()'s re-parse guard then re-parses the XML for
+                // the freshly captured display instead of file_displays[0].
                 self.tree_display_id = self.display_id;
-                self.last_tree_display_id = self.tree_display_id;
                 self.temp_screenshot = Some(png);
                 self.temp_xml = Some(xml);
                 self.in_flight_screenshot = None;
                 self.in_flight_xml = None;
-                self.status_message = Some(if is_u2 {
-                    "uiautomator2 capture successful".into()
-                } else {
-                    "ADB capture successful".into()
+                self.status_message = Some(match method {
+                    CaptureMethod::U2V3 => "uiautomator2 v3 capture successful".into(),
+                    CaptureMethod::Adb => "ADB capture successful".into(),
                 });
                 self.status_is_error = false;
             }
@@ -1230,13 +1394,7 @@ impl App {
                 self.in_flight_xml = None;
                 self.temp_screenshot = old_png;
                 self.temp_xml = old_xml;
-                if is_u2 {
-                    U2_STARTED.store(false, Ordering::Relaxed);
-                }
-                self.status_message = Some(format!(
-                    "{} capture failed: {e}",
-                    if is_u2 { "u2" } else { "ADB" }
-                ));
+                self.status_message = Some(format!("{label} capture failed: {e}"));
                 self.status_is_error = true;
             }
         }
@@ -1249,7 +1407,7 @@ impl eframe::App for App {
         if !self.capturing {
             self.refresh_devices(&ctx);
         }
-        self.poll_device_refresh();
+        self.poll_device_refresh(&ctx);
         self.poll_capture(&ctx);
 
         // Handle double-click tap — two-phase: tap now, capture after settle
@@ -1283,7 +1441,8 @@ impl eframe::App for App {
                 self.tap_settle_start = None;
                 match self.last_capture {
                     Some(CaptureMethod::Adb) => self.start_capture(&ctx, CaptureMethod::Adb),
-                    Some(CaptureMethod::U2) | None => self.start_capture(&ctx, CaptureMethod::U2),
+                    Some(CaptureMethod::U2V3) => self.start_capture(&ctx, CaptureMethod::U2V3),
+                    None => self.start_capture(&ctx, CaptureMethod::Adb),
                 }
             } else {
                 ctx.request_repaint();
@@ -1383,8 +1542,8 @@ impl eframe::App for App {
                     self.start_capture(&ctx, CaptureMethod::Adb);
                 }
                 if ui.add_enabled(!self.capturing, egui::Button::new("⚡ u2 Capture")).clicked() {
-                    self.last_capture = Some(CaptureMethod::U2);
-                    self.start_capture(&ctx, CaptureMethod::U2);
+                    self.last_capture = Some(CaptureMethod::U2V3);
+                    self.start_capture(&ctx, CaptureMethod::U2V3);
                 }
                 if ui.add_enabled(!self.capturing, egui::Button::new("💾 Save")).clicked() {
                     self.save_files();
@@ -1740,17 +1899,15 @@ fn main() -> eframe::Result<()> {
         Ok(Box::new(App::default()))
     }));
 
-    // Cleanup: kill atx-agent, stop uiautomator service, remove forward
-    if let Ok(guard) = U2_SERIAL.lock() {
+    // Cleanup: kill the uiautomator app_process, remove forward
+    stop_u2v3();
+    if let Ok(guard) = U2V3_SERIAL.lock() {
         if let Some(ref serial) = *guard {
             let _ = adb()
-                .args(["-s", serial, "shell", "kill -9 $(pidof atx-agent) 2>/dev/null; true"])
+                .args(["-s", serial, "shell", "pkill -f com.wetest.uia2.Main 2>/dev/null; true"])
                 .output();
             let _ = adb()
-                .args(["-s", serial, "shell", "am force-stop com.github.uiautomator"])
-                .output();
-            let _ = adb()
-                .args(["-s", serial, "forward", "--remove", U2_FORWARD])
+                .args(["-s", serial, "forward", "--remove", U2V3_FORWARD])
                 .output();
         }
     }
