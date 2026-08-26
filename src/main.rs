@@ -31,6 +31,9 @@ const U2V3_ADDR: &str = "127.0.0.1:9008";
 const U2V3_FORWARD: &str = "tcp:9008";
 const U2V3_JAR: &str = "/data/local/tmp/u2.jar";
 const U2V3_PORT: &str = "9008";
+// Main class of the u2.jar app_process server; used by the launch command and
+// the pkill cleanup (the CLASSPATH is an env var, so pkill must match this argv).
+const U2V3_MAIN_CLASS: &str = "com.wetest.uia2.Main";
 const DEVICE_DUMP: &str = "/sdcard/uiviewer_dump.xml";
 const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -248,7 +251,7 @@ struct App {
     available_displays: Vec<(u32, u64)>,
     display_id: u32,
     tree_display_id: u32,
-    last_tree_display_id: u32,
+    parsed_tree_display_id: u32,
     pending_tap: Option<(f32, f32)>,
     tap_settle_start: Option<Instant>,
     last_capture: Option<CaptureMethod>,
@@ -307,7 +310,7 @@ impl Default for App {
             available_displays: vec![(0, 0)],
             display_id: 0,
             tree_display_id: 0,
-            last_tree_display_id: 0,
+            parsed_tree_display_id: 0,
             pending_tap: None,
             tap_settle_start: None,
             last_capture: None,
@@ -879,12 +882,12 @@ fn launch_u2v3(serial: &str) -> Result<(), String> {
     // main class, not the jar path: the CLASSPATH is an environment variable, so
     // `pkill -f u2.jar` never matches the app_process server's argv (verified).
     let _ = adb()
-        .args(["-s", serial, "shell", "pkill -f com.wetest.uia2.Main 2>/dev/null; true"])
+        .args(["-s", serial, "shell", &format!("pkill -f {U2V3_MAIN_CLASS} 2>/dev/null; true")])
         .output();
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     let cmd = format!(
-        "CLASSPATH={U2V3_JAR} app_process / com.wetest.uia2.Main -p {U2V3_PORT}"
+        "CLASSPATH={U2V3_JAR} app_process / {U2V3_MAIN_CLASS} -p {U2V3_PORT}"
     );
     let mut child = adb()
         .args(["-s", serial, "shell", &cmd])
@@ -1065,7 +1068,7 @@ impl App {
                 if !self.file_displays.is_empty() {
                     self.file_xml_content = Some(content.clone());
                     self.tree_display_id = self.file_displays[0];
-                    self.last_tree_display_id = self.tree_display_id;
+                    self.parsed_tree_display_id = self.tree_display_id;
                     self.root_node = parse_windows_xml(&content, self.tree_display_id);
                     if self.root_node.is_none() {
                         eprintln!("Failed to parse --windows XML for display {}", self.tree_display_id);
@@ -1375,7 +1378,7 @@ impl App {
                 }
                 self.load_screenshot(&png, ctx);
                 self.load_xml(&xml, ctx);
-                // Deliberately leave last_tree_display_id stale: when the dump covers
+                // Deliberately leave parsed_tree_display_id stale: when the dump covers
                 // multiple displays, ui()'s re-parse guard then re-parses the XML for
                 // the freshly captured display instead of file_displays[0].
                 self.tree_display_id = self.display_id;
@@ -1462,8 +1465,8 @@ impl eframe::App for App {
         }
 
         // Re-parse when display selector changes for multi-display file
-        if self.file_displays.len() > 1 && self.tree_display_id != self.last_tree_display_id {
-            self.last_tree_display_id = self.tree_display_id;
+        if self.file_displays.len() > 1 && self.tree_display_id != self.parsed_tree_display_id {
+            self.parsed_tree_display_id = self.tree_display_id;
             if let Some(content) = self.file_xml_content.as_deref() {
                 self.root_node = parse_windows_xml(content, self.tree_display_id);
                 self.selected_path = None;
@@ -1904,7 +1907,7 @@ fn main() -> eframe::Result<()> {
     if let Ok(guard) = U2V3_SERIAL.lock() {
         if let Some(ref serial) = *guard {
             let _ = adb()
-                .args(["-s", serial, "shell", "pkill -f com.wetest.uia2.Main 2>/dev/null; true"])
+                .args(["-s", serial, "shell", &format!("pkill -f {U2V3_MAIN_CLASS} 2>/dev/null; true")])
                 .output();
             let _ = adb()
                 .args(["-s", serial, "forward", "--remove", U2V3_FORWARD])
