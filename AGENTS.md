@@ -50,9 +50,11 @@ uiautomator2 capture (u2.jar JSON-RPC), manual file loading, and save-as.
 | `merge_nodes(nodes)` | Wrap multiple root nodes in a synthetic `FrameLayout` root |
 | `load_texture(path, ctx)` | Load image into egui texture; format detected from file **content** (`with_guessed_format`), not extension — handles JPEG-in-`.png` (U2 v3) and mismatched user files |
 | `get_displays(serial)` | Query device for `Vec<(logical_id, physical_id)>` via `dumpsys display` + `dumpsys SurfaceFlinger --display-id` |
-| `adb_capture(serial, display_id, display_physical, png, xml)` | ADB capture: `screencap -p [-d <phys>]` + `uiautomator dump [--windows]` + `adb pull`; `-d` only for secondary (logical id > 0); writes to given unique temp paths |
-| `uiautomator2_v3_capture(serial, display_id, display_physical, png, xml)` | U2 capture: u2.jar lifecycle, `takeScreenshot` (primary)/`dumpWindowHierarchy` via JSON-RPC; secondary displays use ADB `screencap -d <phys>` for the image |
-| `launch_u2v3(serial)` | Spawn u2.jar `app_process` server and poll `/ping` (trimmed match, 30s deadline); failure cleanup is ownership-guarded (`stop_u2v3_if_current`) so a zombie thread can't kill a newer capture's server |
+| `adb_capture(serial, display_id, display_physical, png, xml)` | ADB capture: screenshot and hierarchy run **concurrently** on two adb connections (`std::thread::scope`). Screenshot via `screencap -p [-d <phys>]` (`-d` only for secondary, logical id > 0); hierarchy via a single `exec-out` round trip — `--windows` first with plain-dump fallback, then `cat` + `rm -f`, output trimmed to the `<?xml` prologue (`find_subslice`) since uiautomator exit codes are unreliable |
+| `uiautomator2_v3_capture(serial, display_id, display_physical, png, xml)` | U2 capture: `ensure_u2v3_running` (warm server reuse), then fetches screenshot (`fetch_u2_screenshot`) and hierarchy (`fetch_u2_hierarchy`) concurrently |
+| `ensure_u2v3_running(serial)` | Warm path: forward-ownership check (`u2v3_forward_matches`) + `/ping` probe (`u2v3_alive`); falls back to `launch_u2v3` cold start when either fails |
+| `launch_u2v3(serial)` | Cold start: jar probe + fresh `tcp:9008` forward (stale forwards first swept across `U2V3_MANAGED_SERIALS`, i.e. only sessions this app created) + spawn u2.jar `app_process`, poll `/ping` every `U2V3_PING_POLL_INTERVAL` (100ms) up to a 30s deadline; failure cleanup is ownership-guarded (`stop_u2v3_if_current`) so a zombie thread can't kill a newer capture's server |
+| `release_u2v3_resources(serial)` | Kill a device's u2.jar server (`stop_u2v3`) + drop its `tcp:9008` forward **only if this app created that session** (`U2V3_MANAGED_SERIALS`); called on manual device switch and on auto-switch when the active device disappears |
 | `stop_u2v3()` | Kill the streaming adb shell to terminate the remote app_process |
 | `stop_u2v3_if_current(id)` | Ownership-guarded stop: only kills the stored child if its id matches (zombie-thread safety) |
 | `http_request(addr, method, path, body, read_timeout)` | Raw HTTP/1.1 over TCP with per-call read timeout (`HTTP_READ_TIMEOUT` 30s for JSON-RPC, `U2V3_PING_TIMEOUT` 2s for `/ping` probes so a hung probe can't exceed the launch deadline); used by u2.jar JSON-RPC + `/ping` |
@@ -99,7 +101,7 @@ trigger auto-scroll-to-focused-widget behavior.
 
 - **Display detection**: `get_displays(serial)` returns `Vec<(u32, u64)>` pairing logical IDs (from `dumpsys display`) with physical IDs (from `dumpsys SurfaceFlinger --display-id`)
 - **Display selector**: ComboBox in toolbar (`display_id`, for capture/tap/swipe) and Node Tree panel (`tree_display_id`, for tree filtering only)
-- **ADB**: multi-display uses `screencap -d <phys_id>` + `uiautomator dump --windows`; single uses `screencap -p` + standard `uiautomator dump`
+- **ADB**: `screencap -d <phys_id>` only for secondary displays; hierarchy dump always tries `uiautomator dump --windows` first (all-window coverage, matching the U2 engine) with plain-dump fallback on older Android
 - **U2**: screenshot via JSON-RPC `takeScreenshot` (primary) or ADB `screencap` (secondary); hierarchy via `dumpWindowHierarchy` (primary display only) — neither engine isolates a secondary display's layout, so the layout is each method's best effort. Success status appends "(screenshot via ADB)" (`ShotSource`) whenever the screenshot actually came from `screencap` (secondary display or RPC fallback)
 - **File parsing**: `parse_windows_xml` handles `<hierarchy><displays><display>`, hybrid `<hierarchy><display>`, and `--windows` `<displays><display><window><hierarchy>` formats
 - **On display change**: for file-loaded data, re-parses XML from `file_xml_content` with `tree_display_id` (cached by `parsed_tree_display_id` to avoid per-frame re-parse); for device capture, re-captures with `display_id`
@@ -136,12 +138,14 @@ buttons are disabled while `capturing`.
 - Timeout: drops the receiver so the zombie thread's eventual send fails and its SendError arm self-cleans its own files; also calls `stop_u2v3()` so a zombie U2V3 thread's HTTP calls fail fast instead of hitting a newer capture's server. Disconnected also calls `stop_u2v3()` to kill any server orphaned by a panicked thread
 
 #### ADB Capture
-- `screencap` + `uiautomator dump [--windows]` + `adb pull`
-- Stops any running u2.jar server before capturing
+- Screenshot (`screencap`) and hierarchy dump run **concurrently** on two adb connections; the hierarchy is a single `exec-out` round trip (`uiautomator dump --windows ||` plain dump `; cat; rm -f`) replacing the old separate dump/`adb pull`/`rm` calls
+- Stops any running u2.jar server before capturing (the accessibility connection is exclusive — `uiautomator dump` conflicts with a live u2 server), so alternating ADB → U2 pays the U2 cold start again
 
 #### U2 Capture (u2.jar)
 - Requires `u2.jar` on device (`python -m uiautomator2 init`); the toolbar's u2 button uses this method
-- Each capture: removes stale forward, creates fresh `tcp:9008` forward, then `launch_u2v3` (spawns a fresh `app_process` and polls `/ping` with a 30s deadline)
+- Server kept alive across captures: each capture first runs `ensure_u2v3_running` — forward ownership for the current serial (`u2v3_forward_matches`, guards against multi-device stale forwards routing 127.0.0.1:9008 to the wrong phone) + `/ping` probe (`u2v3_alive`). Only when either fails does `launch_u2v3` cold-start: jar probe → fresh forward → new `app_process` → `/ping` polled every 100ms with a 30s deadline. Warm captures skip jar probe, forward setup and server spawn entirely
+- Ownership attribution: serials whose forward+server this app created are tracked in `U2V3_MANAGED_SERIALS`; all cleanup paths (device-switch release, cold-start sweep, exit cleanup) only touch those. A server started by another tool (e.g. python-uiautomator2, which shares the tcp:9008 convention) is transparently reused via the warm path and left alive on switch/exit; taking over the *target* device itself (unconditional pkill + same-spec forward remove before launch) remains intentional
+- Screenshot (`takeScreenshot` / screencap fallback) and hierarchy (`dumpWindowHierarchy`) are fetched concurrently; if the server serializes requests internally this merely degrades to sequential timing
 - Primary display screenshot via JSON-RPC `takeScreenshot` → base64 JPEG (MIME-style, newline every 76 chars — whitespace stripped before decoding); any takeScreenshot failure (RPC error / non-string / empty / undecodable) falls back to ADB screencap; secondary displays use ADB `screencap -d <phys>` for the image (layout stays primary-only `dumpWindowHierarchy`)
 - Hierarchy via `dumpWindowHierarchy`, retried up to 3× when the server returns empty
 
