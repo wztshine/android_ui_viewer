@@ -279,7 +279,16 @@ enum CaptureMethod {
     U2V3,
 }
 
-type CaptureResult = Result<(PathBuf, PathBuf), String>;
+// How the screenshot bytes of a successful capture were produced. For the ADB
+// method this is always Adb; for U2V3 it distinguishes JSON-RPC from the ADB
+// paths (secondary display by design, or fallback when takeScreenshot fails).
+#[derive(Clone, Copy, PartialEq)]
+enum ShotSource {
+    JsonRpc,
+    Adb,
+}
+
+type CaptureResult = Result<(PathBuf, PathBuf, ShotSource), String>;
 
 struct DeviceRefresh {
     devices: Vec<String>,
@@ -918,7 +927,7 @@ fn launch_u2v3(serial: &str) -> Result<(), String> {
     Err(format!("{U2V3_JAR} failed to start — server did not answer /ping in 30s"))
 }
 
-fn uiautomator2_v3_capture(serial: &str, display_id: u32, display_physical: u64, png: PathBuf, xml: PathBuf) -> Result<(PathBuf, PathBuf), String> {
+fn uiautomator2_v3_capture(serial: &str, display_id: u32, display_physical: u64, png: PathBuf, xml: PathBuf) -> Result<(PathBuf, PathBuf, ShotSource), String> {
     let mut tmp_guard = TempGuard::new();
 
     // Require the u2.jar to be present (pushed via `python -m uiautomator2 init`).
@@ -954,7 +963,7 @@ fn uiautomator2_v3_capture(serial: &str, display_id: u32, display_physical: u64,
     // displays (logical id > 0) always use the ADB screencap path. The physical
     // id is an opaque token for every display, so "secondary" is detected via
     // the logical id.
-    let png_bytes = if display_id > 0 {
+    let (png_bytes, shot_source) = if display_id > 0 {
         let phys_str = display_physical.to_string();
         let out = adb()
             .args(["-s", serial, "exec-out", "screencap", "-p", "-d", &phys_str])
@@ -963,7 +972,7 @@ fn uiautomator2_v3_capture(serial: &str, display_id: u32, display_physical: u64,
         if !out.status.success() {
             return Err("screencap returned error".into());
         }
-        out.stdout
+        (out.stdout, ShotSource::Adb)
     } else {
         // Primary display: takeScreenshot(display_id, quality). The first param
         // is a numeric display id (a path string is rejected by the server); 0
@@ -981,7 +990,7 @@ fn uiautomator2_v3_capture(serial: &str, display_id: u32, display_physical: u64,
             .filter(|b64| !b64.is_empty())
             .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(&b64).ok());
         match decoded {
-            Some(bytes) => bytes,
+            Some(bytes) => (bytes, ShotSource::JsonRpc),
             None => {
                 let out = adb()
                     .args(["-s", serial, "exec-out", "screencap", "-p"])
@@ -990,7 +999,7 @@ fn uiautomator2_v3_capture(serial: &str, display_id: u32, display_physical: u64,
                 if !out.status.success() {
                     return Err("screencap returned error".into());
                 }
-                out.stdout
+                (out.stdout, ShotSource::Adb)
             }
         }
     };
@@ -1024,7 +1033,7 @@ fn uiautomator2_v3_capture(serial: &str, display_id: u32, display_physical: u64,
     std::fs::write(&xml, &xml_bytes).map_err(|e| format!("write xml: {e}"))?;
 
     tmp_guard.disarm();
-    Ok((png, xml))
+    Ok((png, xml, shot_source))
 }
 
 impl App {
@@ -1291,7 +1300,11 @@ impl App {
                 }
                 CaptureMethod::Adb => {
                     stop_u2v3();
-                    (CaptureMethod::Adb, adb_capture(&serial, display_id, phys_id, png.clone(), xml.clone()))
+                    (
+                        CaptureMethod::Adb,
+                        adb_capture(&serial, display_id, phys_id, png.clone(), xml.clone())
+                            .map(|(p, x)| (p, x, ShotSource::Adb)),
+                    )
                 }
             };
             match tx.send((method, result)) {
@@ -1300,7 +1313,7 @@ impl App {
                     // Receiver dropped (app exited mid-capture): the fresh temps
                     // were disarmed from this thread's TempGuard, so remove them
                     // here to avoid leaving orphan files in the temp dir.
-                    if let Ok((png, xml)) = result {
+                    if let Ok((png, xml, _)) = result {
                         let _ = std::fs::remove_file(&png);
                         let _ = std::fs::remove_file(&xml);
                     }
@@ -1368,7 +1381,7 @@ impl App {
         };
 
         match result {
-            Ok((png, xml)) => {
+            Ok((png, xml, shot_source)) => {
                 // The previous capture's unique temp files are no longer needed.
                 if let Some(p) = old_png {
                     let _ = std::fs::remove_file(&p);
@@ -1386,8 +1399,12 @@ impl App {
                 self.temp_xml = Some(xml);
                 self.in_flight_screenshot = None;
                 self.in_flight_xml = None;
+                // Surface the data source when U2V3's screenshot actually came
+                // from adb screencap (secondary display, or RPC fallback).
+                let via_adb = method == CaptureMethod::U2V3 && shot_source == ShotSource::Adb;
+                let suffix = if via_adb { " (screenshot via ADB)" } else { "" };
                 self.status_message = Some(match method {
-                    CaptureMethod::U2V3 => "uiautomator2 v3 capture successful".into(),
+                    CaptureMethod::U2V3 => format!("uiautomator2 v3 capture successful{suffix}"),
                     CaptureMethod::Adb => "ADB capture successful".into(),
                 });
                 self.status_is_error = false;
