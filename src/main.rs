@@ -2013,6 +2013,7 @@ impl eframe::App for App {
                 .id_salt("tree_scroll")
                 .max_height(tree_max)
                 .auto_shrink([true, false])
+                .hscroll(true)
                 .show(ui, |ui| {
                     let mut node_rects = Vec::new();
                     if let Some(ref root) = self.root_node {
@@ -2029,11 +2030,18 @@ impl eframe::App for App {
                         }
                     });
                     if let Some(pos) = click_info {
-                        for (path, rect) in &node_rects {
-                            if rect.contains(pos) {
-                                self.selected_path = Some(path.clone());
-                                self.last_selected = Some(path.clone());
-                                break;
+                        // Only honor clicks inside the tree's visible viewport.
+                        // Scrolled-out rows still have live screen-space rects
+                        // that extend past the viewport bottom into the
+                        // Properties area below — without this gate a click
+                        // there would phantom-select a hidden node.
+                        if ui.clip_rect().contains(pos) {
+                            for (path, rect) in &node_rects {
+                                if rect.contains(pos) {
+                                    self.selected_path = Some(path.clone());
+                                    self.last_selected = Some(path.clone());
+                                    break;
+                                }
                             }
                         }
                     }

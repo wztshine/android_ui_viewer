@@ -71,11 +71,21 @@ uiautomator2 capture (u2.jar JSON-RPC), manual file loading, and save-as.
 CentralPanel                              — Screenshot image with hover/click/drag overlays
 Panel::right("properties_panel")          — Node Tree + Properties panels (resizable)
   ├── display selector (tree_display_id)
-  ├── tree scroll area
+  ├── tree scroll area (hscroll enabled)
   └── properties scroll area
 Panel::top("toolbar")                     — Load/ADB/U2/Save buttons + display selector + file names
 Panel::bottom("status")                   — Status messages
 ```
+
+The right panel is sized by egui's content-driven `Panel` API: the panel's stored
+width follows its content's `min_rect` (egui panel.rs reassigns the persisted rect
+from the rendered frame rect). The tree `ScrollArea` is vertical-only with
+`auto_shrink([true, false])`, which makes a disabled axis follow the content width —
+so expanding deep nodes (long indent + unwrapped labels) would grow the panel and
+squeeze the central image. `.hscroll(true)` keeps the disabled axis bounded by the
+panel's available width (ScrollArea sizes to `min(available, content)` on an enabled
+axis), so the divider stays where the user dragged it and wide tree rows instead
+scroll horizontally.
 
 ### Tree Click Handling (critical pattern)
 
@@ -84,11 +94,17 @@ Click detection is done entirely via raw input:
 
 1. Each node's screen-space `rect` is recorded in `node_rects: Vec<(Vec<usize>, Rect)>`
 2. After tree renders, `ui.input(|i| i.pointer.any_click())` checks for clicks
-3. `interact_pos()` gives the click position; matched against `node_rects`
-4. Arrow expand/collapse uses `Label::sense(Sense::click())` and does NOT cause jumps
+3. `interact_pos()` gives the click position; **gated by `ui.clip_rect().contains(pos)`** —
+   only clicks inside the visible tree viewport are honored
+4. Matched against `node_rects`
+5. Arrow expand/collapse uses `Label::sense(Sense::click())` and does NOT cause jumps
 
 This avoids `selectable_label` and any interactive widget inside ScrollArea that would
 trigger auto-scroll-to-focused-widget behavior.
+
+The viewport gate matters because a scrolled-out tree row still has a live
+screen-space rect that extends past the viewport bottom into the Properties area
+below — without the gate, a click there would phantom-select a hidden node.
 
 ### Image Interaction
 
