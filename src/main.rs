@@ -151,6 +151,11 @@ fn adb() -> Command {
     {
         let mut cmd = Command::new("adb");
         cmd.creation_flags(CREATE_NO_WINDOW);
+        // Never inherit stdin: after FreeConsole() the process has no valid
+        // standard handles, so an inherited stdin would make Command::spawn()
+        // fail with os error 50 (ERROR_NOT_SUPPORTED). All adb calls are
+        // fire-and-read, none needs stdin.
+        cmd.stdin(std::process::Stdio::null());
         cmd
     }
     #[cfg(not(target_os = "windows"))]
@@ -2446,10 +2451,25 @@ impl eframe::App for App {
 fn main() -> eframe::Result<()> {
     #[cfg(target_os = "windows")]
     {
+        // Detach from any console so a GUI launch doesn't flash a cmd window.
+        // After FreeConsole the standard handles are left dangling (still
+        // pointing at the freed console), so Command::spawn (which inherits
+        // stdin by default) would fail with os error 50 / ERROR_NOT_SUPPORTED.
+        // Reset them to INVALID_HANDLE_VALUE first — the same workaround as
+        // rust-lang/rust#100884 and #113277.
         extern "system" {
             fn FreeConsole() -> i32;
+            fn SetStdHandle(n_std_handle: u32, handle: *mut core::ffi::c_void) -> i32;
         }
-        unsafe { FreeConsole(); }
+        const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+        const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+        const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+        unsafe {
+            for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                SetStdHandle(h, core::ptr::null_mut());
+            }
+            FreeConsole();
+        }
     }
 
     let options = eframe::NativeOptions {
