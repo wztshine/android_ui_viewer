@@ -299,6 +299,7 @@ struct App {
     in_flight_xml: Option<PathBuf>,
     refresh_rx: Option<mpsc::Receiver<DeviceRefresh>>,
     refresh_start: Option<Instant>,
+    manual_refreshing: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -374,6 +375,7 @@ impl Default for App {
             in_flight_xml: None,
             refresh_rx: None,
             refresh_start: None,
+            manual_refreshing: false,
         }
     }
 }
@@ -691,12 +693,30 @@ fn adb_output_bounded(args: &[&str], timeout: std::time::Duration) -> Option<std
 }
 
 fn get_displays(serial: &str) -> Vec<(u32, u64)> {
-    // Get physical display IDs from SurfaceFlinger
-    let physical_output = adb_output_bounded(
-        &["-s", serial, "shell", "dumpsys", "SurfaceFlinger", "--display-id"],
-        REFRESH_ADB_TIMEOUT,
-    )
-    .filter(|o| o.status.success());
+    // Physical (SurfaceFlinger) and logical (display manager) display ids are
+    // independent reads of disjoint device subsystems, so they are fetched
+    // concurrently: worst-case latency becomes max(a, b) instead of a + b while
+    // each call keeps its own timeout budget.
+    let (physical_output, logical_output) = std::thread::scope(|s| {
+        let h_phys = s.spawn(|| {
+            adb_output_bounded(
+                &["-s", serial, "shell", "dumpsys", "SurfaceFlinger", "--display-id"],
+                REFRESH_ADB_TIMEOUT,
+            )
+            .filter(|o| o.status.success())
+        });
+        let h_log = s.spawn(|| {
+            adb_output_bounded(
+                &["-s", serial, "shell", "dumpsys", "display"],
+                REFRESH_ADB_TIMEOUT,
+            )
+            .filter(|o| o.status.success())
+        });
+        (
+            h_phys.join().unwrap_or(None),
+            h_log.join().unwrap_or(None),
+        )
+    });
     let mut logical_to_physical: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     if let Some(output) = physical_output {
         let text = String::from_utf8_lossy(&output.stdout);
@@ -720,11 +740,6 @@ fn get_displays(serial: &str) -> Vec<(u32, u64)> {
     }
 
     // Get logical display IDs from dumpsys display
-    let logical_output = adb_output_bounded(
-        &["-s", serial, "shell", "dumpsys", "display"],
-        REFRESH_ADB_TIMEOUT,
-    )
-    .filter(|o| o.status.success());
     let mut logical_ids: Vec<u32> = if let Some(output) = logical_output {
         let text = String::from_utf8_lossy(&output.stdout);
         text.lines()
@@ -1373,6 +1388,7 @@ impl App {
             Some(Ok(result)) => {
                 self.refresh_rx = None;
                 self.refresh_start = None;
+                self.manual_refreshing = false;
                 self.adb_devices = result.devices;
                 if !self.adb_devices.contains(&self.selected_device.as_deref().unwrap_or_default().to_string()) {
                     // Active device disappeared: fall back to the first one and
@@ -1405,6 +1421,7 @@ impl App {
                         // Abandon the hung refresh so it can't block future ones forever.
                         self.refresh_rx = None;
                         self.refresh_start = None;
+                        self.manual_refreshing = false;
                         self.status_message =
                             Some("device refresh timed out — adb not responding".into());
                         self.status_is_error = true;
@@ -1416,6 +1433,7 @@ impl App {
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.refresh_rx = None;
                 self.refresh_start = None;
+                self.manual_refreshing = false;
             }
             None => {}
         }
@@ -1853,10 +1871,11 @@ impl eframe::App for App {
                         self.load_xml(&path, &ctx);
                     }
                 }
-                if ui.button("🔄 Refresh device").clicked() {
+                if ui.add_enabled(!self.manual_refreshing, egui::Button::new("🔄 Refresh device")).clicked() {
                     // Force: abandon any in-flight scan (dropping the receiver
                     // makes its send fail harmlessly; the thread self-cleans)
                     // and bypass the rate limit so every click scans now.
+                    self.manual_refreshing = true;
                     self.refresh_rx = None;
                     self.refresh_start = None;
                     self.refresh_devices(&ctx, true);
