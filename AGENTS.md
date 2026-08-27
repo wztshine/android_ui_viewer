@@ -160,6 +160,15 @@ buttons are disabled while `capturing`.
 - Timeout: previous temps restored; zombie thread self-cleans via SendError once its adb returns; `in_flight_*` covers exit-time cleanup
 - User load: `load_screenshot`/`load_xml` remove the tracked temp only after the new file loads successfully (a failed load keeps the current screenshot/XML usable)
 
+### Keep Monitor (Auto Capture)
+
+Toolbar checkbox + interval stepper (`-`/`+` buttons, 0.5s steps, clamped 0.5–60s; changes reschedule the next tick immediately). Checking it fires a capture **immediately** and disables the two capture buttons; unchecking (or any capture failure) calls `stop_keep_monitor()` which clears the schedule, probe state, and checkbox.
+
+- **Method/source**: uses `last_capture` (the previously used method); `start_capture` reads the currently selected device + display id at fire time. Ticks yield while `pending_tap`/`tap_settle_start` is active so user tap/swipe feedback recaptures are never displaced.
+- **Scheduling**: next tick is scheduled from each capture *completion* (`poll_capture` Ok arm) — natural backpressure when a capture outlasts the interval.
+- **Two-tier change detection (U2 method only)**: each tick first runs an off-thread hierarchy-only RPC probe (`probe_u2_hierarchy_hash`, result hashed with FNV-1a). Full capture fires only when the hash changed, every `MONITOR_FORCE_REFRESH_EVERY` unchanged probes (eventual consistency for pixel-only changes like video), or when the probe fails (then the real capture surfaces the error or recovers). ADB method always captures fully (its probe would cost the same JVM spawn).
+- **Tree panel**: monitor-driven captures never retarget `tree_display_id` (`capture_source_auto` flag distinguishes them from user-driven ones); successful captures made while monitoring refresh the baseline hash from the fresh dump.
+
 ## Common Commands
 
 ```sh

@@ -53,6 +53,18 @@ const U2V3_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 // A short interval keeps perceived startup latency close to the actual boot
 // time instead of quantizing it to the poll period (was 500ms).
 const U2V3_PING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+// Keep-monitor two-tier probing (U2 method): a hierarchy-only RPC is hashed
+// each tick; full captures run only when the hash changed, or every
+// MONITOR_FORCE_REFRESH_EVERY unchanged probes as an eventual-consistency
+// guarantee (XML cannot see pixel-only changes like video/canvas content).
+const MONITOR_FORCE_REFRESH_EVERY: u32 = 10;
+// FNV-1a 64-bit constants for cheap XML change detection.
+const FNV1A_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+// Keep-monitor liveness heartbeat (ms): while monitoring, guarantee periodic
+// frames so a missed repaint request anywhere can never freeze the UI until
+// the next input event arrives.
+const MONITOR_HEARTBEAT_MS: u64 = 100;
 // JSON-RPC params: takeScreenshot(display_id, quality) — numeric display id,
 // 0 = primary; returns base64 JPEG. dumpWindowHierarchy(compressed, max_depth)
 // mirrors uiautomator2's dump_hierarchy(compressed=False, max_depth=50).
@@ -264,6 +276,13 @@ struct App {
     pending_tap: Option<(f32, f32)>,
     tap_settle_start: Option<Instant>,
     last_capture: Option<CaptureMethod>,
+    keep_monitor: bool,
+    monitor_interval_secs: f64,
+    next_auto_capture: Option<Instant>,
+    capture_source_auto: bool,
+    monitor_xml_hash: Option<u64>,
+    monitor_probe_count: u32,
+    monitor_probe_rx: Option<mpsc::Receiver<Option<u64>>>,
     click_pos: Option<Pos2>,
     last_hover_img_pos: Option<Pos2>,
     file_displays: Vec<u32>,
@@ -332,6 +351,13 @@ impl Default for App {
             pending_tap: None,
             tap_settle_start: None,
             last_capture: None,
+            keep_monitor: false,
+            monitor_interval_secs: 3.0,
+            next_auto_capture: None,
+            capture_source_auto: false,
+            monitor_xml_hash: None,
+            monitor_probe_count: 0,
+            monitor_probe_rx: None,
             click_pos: None,
             last_hover_img_pos: None,
             file_displays: Vec::new(),
@@ -951,6 +977,37 @@ fn u2v3_alive() -> bool {
     )
 }
 
+fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    let mut hash = FNV1A_OFFSET;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV1A_PRIME);
+    }
+    hash
+}
+
+// Cheap keep-monitor probe for the U2 method: fetch only the hierarchy via
+// JSON-RPC and return its hash. None on any failure (server dead, transport
+// error, empty dump) — callers fall back to a full capture, which either
+// recovers from a transient hiccup or stops monitoring via the normal
+// failure policy.
+fn probe_u2_hierarchy_hash() -> Option<u64> {
+    let raw = http_jsonrpc(
+        "dumpWindowHierarchy",
+        &[U2V3_DUMP_COMPRESSED.into(), U2V3_DUMP_MAX_DEPTH.into()],
+    )
+        .and_then(|v| {
+            v.as_str()
+                .map(|s| s.as_bytes().to_vec())
+                .ok_or_else(|| "dumpWindowHierarchy: not a string".into())
+        })
+        .ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(fnv1a_hash(&raw))
+}
+
 // Reuse a healthy server across captures: the warm path costs a forward-ownership
 // check plus one /ping probe, while the full cold start runs only when either
 // fails.
@@ -1368,6 +1425,10 @@ impl App {
             None => {
                 self.status_message = Some("No device selected — connect a device and ensure it appears in the dropdown".into());
                 self.status_is_error = true;
+                // A capture that can't start is a capture failure: stop auto-
+                // monitoring so the checkbox can't stay checked with nothing
+                // scheduled (no tick, no probe) or respam errors every interval.
+                self.stop_keep_monitor();
                 return;
             }
         };
@@ -1448,6 +1509,15 @@ impl App {
         });
     }
 
+    // Turn keep-monitor off and clear its scheduling/probe state. Used on
+    // capture failures so a dead device can't produce endless error spam,
+    // and on manual uncheck.
+    fn stop_keep_monitor(&mut self) {
+        self.keep_monitor = false;
+        self.next_auto_capture = None;
+        self.monitor_probe_rx = None;
+    }
+
     fn poll_capture(&mut self, ctx: &egui::Context) {
         let (method, result) = match self.capture_rx.as_ref() {
             None => return,
@@ -1470,6 +1540,9 @@ impl App {
                             self.temp_xml = self.pending_old_xml.take();
                             self.status_message = Some("capture timed out — device not responding".into());
                             self.status_is_error = true;
+                            // A failed capture stops keep-monitor so a dead
+                            // device can't produce endless error spam.
+                            self.stop_keep_monitor();
                         } else {
                             // Wake up precisely at the deadline so the timeout fires
                             // even without user input (no always-on repaint loop).
@@ -1491,6 +1564,8 @@ impl App {
                     self.temp_xml = self.pending_old_xml.take();
                     self.status_message = Some("capture failed: background thread ended unexpectedly".into());
                     self.status_is_error = true;
+                    // Same policy as the timeout path: stop auto-monitoring.
+                    self.stop_keep_monitor();
                     return;
                 }
             },
@@ -1520,7 +1595,21 @@ impl App {
                 // Deliberately leave parsed_tree_display_id stale: when the dump covers
                 // multiple displays, ui()'s re-parse guard then re-parses the XML for
                 // the freshly captured display instead of file_displays[0].
-                self.tree_display_id = self.display_id;
+                // Monitor-driven captures respect the user's tree-display
+                // selection and never retarget it.
+                if !self.capture_source_auto {
+                    self.tree_display_id = self.display_id;
+                }
+                // Refresh the keep-monitor change-detection baseline from this
+                // fresh dump (also covers settle recaptures made during
+                // monitoring), so the next probe compares against what is on
+                // screen now.
+                if self.keep_monitor {
+                    if let Ok(bytes) = std::fs::read(&xml) {
+                        self.monitor_xml_hash = Some(fnv1a_hash(&bytes));
+                    }
+                    self.monitor_probe_count = 0;
+                }
                 self.temp_screenshot = Some(png);
                 self.temp_xml = Some(xml);
                 self.in_flight_screenshot = None;
@@ -1534,6 +1623,14 @@ impl App {
                     CaptureMethod::Adb => "ADB capture successful".into(),
                 });
                 self.status_is_error = false;
+                // Keep-monitor: schedule the next automatic capture from this
+                // completion (backpressure when a capture outlasts the interval).
+                if self.keep_monitor {
+                    self.next_auto_capture = Some(
+                        Instant::now()
+                            + std::time::Duration::from_secs_f64(self.monitor_interval_secs),
+                    );
+                }
             }
             Err(e) => {
                 self.in_flight_screenshot = None;
@@ -1542,6 +1639,8 @@ impl App {
                 self.temp_xml = old_xml;
                 self.status_message = Some(format!("{label} capture failed: {e}"));
                 self.status_is_error = true;
+                // Same policy as the timeout path: stop auto-monitoring.
+                self.stop_keep_monitor();
             }
         }
     }
@@ -1585,6 +1684,9 @@ impl eframe::App for App {
         if let Some(tap_start) = self.tap_settle_start {
             if tap_start.elapsed() >= std::time::Duration::from_millis(800) {
                 self.tap_settle_start = None;
+                // Settle recaptures are user-driven feedback (tap/swipe result),
+                // not monitor ticks.
+                self.capture_source_auto = false;
                 match self.last_capture {
                     Some(CaptureMethod::Adb) => self.start_capture(&ctx, CaptureMethod::Adb),
                     Some(CaptureMethod::U2V3) => self.start_capture(&ctx, CaptureMethod::U2V3),
@@ -1592,6 +1694,105 @@ impl eframe::App for App {
                 }
             } else {
                 ctx.request_repaint();
+            }
+        }
+
+        // Keep-monitor: fire an automatic capture when due. Ticks yield to the
+        // user's gesture chain (tap/swipe settle recaptures) so the feedback
+        // capture is never displaced; poll_capture reschedules the next tick
+        // from each completion, which also provides backpressure when a
+        // capture takes longer than the interval.
+        if self.keep_monitor {
+            // Liveness heartbeat: egui only repaints on input or explicit
+            // requests; the tick/probe/capture wake-up chains below have many
+            // branches, so guarantee a periodic frame regardless.
+            ctx.request_repaint_after(std::time::Duration::from_millis(MONITOR_HEARTBEAT_MS));
+            // A background hierarchy probe is in flight (U2 two-tier mode):
+            // consume its result without blocking the UI thread.
+            if let Some(rx) = self.monitor_probe_rx.take() {
+                match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => {
+                        self.monitor_probe_rx = Some(rx);
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    }
+                    result => {
+                        // Probe thread died → None → fall back to a full capture.
+                        let hash = match result {
+                            Ok(h) => h,
+                            _ => None,
+                        };
+                        if !self.capturing
+                            && self.pending_tap.is_none()
+                            && self.tap_settle_start.is_none()
+                        {
+                            let mut fire = true;
+                            if let Some(h) = hash {
+                                self.monitor_probe_count += 1;
+                                let forced =
+                                    self.monitor_probe_count >= MONITOR_FORCE_REFRESH_EVERY;
+                                if forced {
+                                    self.monitor_probe_count = 0;
+                                }
+                                fire = forced || self.monitor_xml_hash != Some(h);
+                                self.monitor_xml_hash = Some(h);
+                            }
+                            if fire {
+                                self.capture_source_auto = true;
+                                self.next_auto_capture = None;
+                                let method = self.last_capture.unwrap_or(CaptureMethod::Adb);
+                                self.start_capture(&ctx, method);
+                            } else {
+                                // Unchanged: schedule the next probe from now.
+                                self.next_auto_capture = Some(
+                                    Instant::now()
+                                        + std::time::Duration::from_secs_f64(
+                                            self.monitor_interval_secs,
+                                        ),
+                                );
+                                ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                                    self.monitor_interval_secs,
+                                ));
+                            }
+                        }
+                        // Gesture/capture started while probing: skip this
+                        // round. Reschedule defensively so the monitor can't
+                        // stall even if the blocking action ends without
+                        // passing through poll_capture (e.g. no-device bail).
+                        self.next_auto_capture = Some(
+                            Instant::now()
+                                + std::time::Duration::from_secs_f64(self.monitor_interval_secs),
+                        );
+                    }
+                }
+            } else if let Some(next) = self.next_auto_capture {
+                let now = Instant::now();
+                if now >= next {
+                    if !self.capturing
+                        && self.pending_tap.is_none()
+                        && self.tap_settle_start.is_none()
+                    {
+                        let method = self.last_capture.unwrap_or(CaptureMethod::Adb);
+                        if method == CaptureMethod::U2V3 {
+                            // Two-tier probing: fetch only the hierarchy off
+                            // the UI thread and decide on the next frame. An
+                            // adb-method probe would cost the same as a full
+                            // capture (JVM spawn), so it always captures fully.
+                            let (tx, rx) = mpsc::channel();
+                            self.monitor_probe_rx = Some(rx);
+                            std::thread::spawn(move || {
+                                let _ = tx.send(probe_u2_hierarchy_hash());
+                            });
+                        } else {
+                            self.capture_source_auto = true;
+                            self.next_auto_capture = None;
+                            self.start_capture(&ctx, method);
+                        }
+                    }
+                    // Blocked by an in-flight gesture/capture: retry on the
+                    // next repaint (those paths already request repaints).
+                } else {
+                    ctx.request_repaint_after(next - now);
+                }
             }
         }
 
@@ -1693,12 +1894,49 @@ impl eframe::App for App {
                     });
                 }
                 ui.separator();
-                if ui.add_enabled(!self.capturing, egui::Button::new("📱 ADB Capture")).clicked() {
+                // Keep-monitor switch: auto-capture with the last used method
+                // at a fixed interval. Toggling on fires immediately; the two
+                // capture buttons are disabled while it runs.
+                if ui.checkbox(&mut self.keep_monitor, "Keep monitor").changed() {
+                    if self.keep_monitor {
+                        // Fire immediately, then reschedule from completions.
+                        self.next_auto_capture = Some(Instant::now());
+                    } else {
+                        self.stop_keep_monitor();
+                    }
+                }
+                // Interval stepper: [-]/[+] adjust in 0.5s steps (clamped to
+                // 0.5–60s); changes take effect immediately by rescheduling the
+                // next tick from now.
+                let mut step = 0.0f64;
+                ui.add_enabled_ui(self.keep_monitor, |ui| {
+                    if ui.small_button("-").clicked() {
+                        step = -0.5;
+                    }
+                    ui.monospace(format!("{:>4.1}s", self.monitor_interval_secs))
+                        .on_hover_text("Auto-capture interval in seconds (-/+ adjust by 0.5)");
+                    if ui.small_button("+").clicked() {
+                        step = 0.5;
+                    }
+                });
+                if step != 0.0 {
+                    self.monitor_interval_secs =
+                        (self.monitor_interval_secs + step).clamp(0.5, 60.0);
+                    if !self.capturing && self.monitor_probe_rx.is_none() {
+                        self.next_auto_capture = Some(
+                            Instant::now()
+                                + std::time::Duration::from_secs_f64(self.monitor_interval_secs),
+                        );
+                    }
+                }
+                if ui.add_enabled(!self.capturing && !self.keep_monitor, egui::Button::new("📱 ADB Capture")).clicked() {
                     self.last_capture = Some(CaptureMethod::Adb);
+                    self.capture_source_auto = false;
                     self.start_capture(&ctx, CaptureMethod::Adb);
                 }
-                if ui.add_enabled(!self.capturing, egui::Button::new("⚡ u2 Capture")).clicked() {
+                if ui.add_enabled(!self.capturing && !self.keep_monitor, egui::Button::new("⚡ u2 Capture")).clicked() {
                     self.last_capture = Some(CaptureMethod::U2V3);
+                    self.capture_source_auto = false;
                     self.start_capture(&ctx, CaptureMethod::U2V3);
                 }
                 if ui.add_enabled(!self.capturing, egui::Button::new("💾 Save")).clicked() {
