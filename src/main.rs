@@ -301,7 +301,7 @@ struct App {
     manual_refreshing: bool,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum CaptureMethod {
     Adb,
     U2V3,
@@ -322,6 +322,8 @@ struct DeviceRefresh {
     devices: Vec<String>,
     selected: Option<String>,
     displays: Option<Vec<(u32, u64)>>,
+    // Temporary diagnostic detail from the scan (why the device list is empty).
+    diag: Option<String>,
 }
 
 impl Default for App {
@@ -467,6 +469,26 @@ fn merge_nodes(nodes: Vec<UiNode>) -> Option<UiNode> {
     })
 }
 
+// Collect top-level <node> children of a plain <hierarchy> whose display-id
+// attribute matches `display_id`, and merge them under a synthetic root.
+// Handles multi-display dumps that carry display-id on the top-level nodes
+// instead of using the <displays>/<display> wrapper. A node without a
+// display-id attribute is treated as belonging to display 0 (primary).
+fn parse_plain_hierarchy_display(root: &roxmltree::Node, display_id: u32) -> Option<UiNode> {
+    let nodes: Vec<UiNode> = root
+        .children()
+        .filter(|c| c.is_element() && c.tag_name().name() == "node")
+        .filter(|c| {
+            c.attribute("display-id")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0)
+                == display_id
+        })
+        .filter_map(|c| parse_node(&c))
+        .collect();
+    merge_nodes(nodes)
+}
+
 fn parse_windows_xml(text: &str, display_id: u32) -> Option<UiNode> {
     let doc = Document::parse(text).ok()?;
     let root = doc.root_element();
@@ -490,11 +512,19 @@ fn parse_windows_xml(text: &str, display_id: u32) -> Option<UiNode> {
         if from_displays.is_some() {
             from_displays
         } else {
-            root.children().filter(|c| c.is_element() && c.tag_name().name() == "display")
+            let direct = root.children().filter(|c| c.is_element() && c.tag_name().name() == "display")
                 .find_map(|c| {
                     let id = c.attribute("id")?.parse::<u32>().ok()?;
                     if id == display_id { Some(c) } else { None }
-                })
+                });
+            if direct.is_some() {
+                direct
+            } else {
+                // Plain <hierarchy> whose top-level <node>s carry a display-id
+                // attribute (no <displays>/<display> wrapper). Return the
+                // merged nodes for this display directly.
+                return parse_plain_hierarchy_display(&root, display_id);
+            }
         }
     } else {
         return None;
@@ -552,18 +582,42 @@ fn get_display_ids_from_xml(text: &str) -> Vec<u32> {
             .collect();
     }
     if root.tag_name().name() == "hierarchy" {
-        // Check for <displays> wrapper first
-        if let Some(displays) = root.children().find(|c| c.is_element() && c.tag_name().name() == "displays") {
-            return displays.children()
-                .filter(|c| c.is_element() && c.tag_name().name() == "display")
-                .filter_map(|c| c.attribute("id")?.parse::<u32>().ok())
-                .collect();
+        // <hierarchy> <displays> <display>...
+        let from_displays = root.children()
+            .find(|c| c.is_element() && c.tag_name().name() == "displays")
+            .map(|displays| {
+                displays.children()
+                    .filter(|c| c.is_element() && c.tag_name().name() == "display")
+                    .filter_map(|c| c.attribute("id")?.parse::<u32>().ok())
+                    .collect::<Vec<u32>>()
+            })
+            .unwrap_or_default();
+        if !from_displays.is_empty() {
+            return from_displays;
         }
-        // Fallback: <display> directly under <hierarchy>
-        return root.children()
+        // <display> directly under <hierarchy>
+        let direct: Vec<u32> = root.children()
             .filter(|c| c.is_element() && c.tag_name().name() == "display")
             .filter_map(|c| c.attribute("id")?.parse::<u32>().ok())
             .collect();
+        if !direct.is_empty() {
+            return direct;
+        }
+        // Plain <hierarchy> whose top-level <node>s carry a display-id attribute
+        // (multi-display uiautomator dump without the --windows wrapper). A node
+        // missing the attribute is treated as display 0, mirroring the
+        // get_display_ids_from_xml fallback below.
+        let mut node_ids: Vec<u32> = root.children()
+            .filter(|c| c.is_element() && c.tag_name().name() == "node")
+            .map(|c| {
+                c.attribute("display-id")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0)
+            })
+            .collect();
+        node_ids.sort();
+        node_ids.dedup();
+        return node_ids;
     }
     Vec::new()
 }
@@ -651,7 +705,10 @@ fn adb_output_bounded(args: &[&str], timeout: std::time::Duration) -> Option<std
     let tmp = std::env::temp_dir().join(format!("uiviewer_adb_{}.out", next_temp_id()));
     let file = match std::fs::File::create(&tmp) {
         Ok(f) => f,
-        Err(_) => return None,
+        Err(e) => {
+            eprintln!("[uiviewer] adb_output_bounded: create temp file {:?} failed: {e}", tmp);
+            return None;
+        }
     };
     let mut child = match adb()
         .args(args)
@@ -660,7 +717,8 @@ fn adb_output_bounded(args: &[&str], timeout: std::time::Duration) -> Option<std
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
+            eprintln!("[uiviewer] adb_output_bounded: spawn `adb {:?}` failed: {e}", args);
             let _ = std::fs::remove_file(&tmp);
             return None;
         }
@@ -671,22 +729,46 @@ fn adb_output_bounded(args: &[&str], timeout: std::time::Duration) -> Option<std
             Ok(Some(st)) => break st,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = std::fs::remove_file(&tmp);
+                    // Timeout: do NOT kill the adb client. Killing a client that
+                    // is mid cold-start leaves the shared adb server half
+                    // initialized and corrupts it for every tool on the machine.
+                    // Detach the child to a reaper thread instead: it finishes
+                    // on its own and the temp file is removed once its handle
+                    // is released.
+                    eprintln!(
+                        "[uiviewer] adb_output_bounded: `adb {:?}` timed out after {:?}; detaching",
+                        args, timeout
+                    );
+                    let tmp2 = tmp.clone();
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                        let _ = std::fs::remove_file(&tmp2);
+                    });
                     return None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = std::fs::remove_file(&tmp);
+            Err(e) => {
+                eprintln!("[uiviewer] adb_output_bounded: try_wait `adb {:?}` error: {e}", args);
+                // try_wait error: same policy, let the client finish on its own
+                // rather than risking a corrupted adb server for other tools.
+                let tmp2 = tmp.clone();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                    let _ = std::fs::remove_file(&tmp2);
+                });
                 return None;
             }
         }
     };
     let stdout = std::fs::read(&tmp).unwrap_or_default();
     let _ = std::fs::remove_file(&tmp);
+    eprintln!(
+        "[uiviewer] adb_output_bounded: `adb {:?}` ok status={:?} stdout={} bytes",
+        args,
+        status,
+        stdout.len()
+    );
     Some(std::process::Output { status, stdout, stderr: Vec::new() })
 }
 
@@ -716,7 +798,7 @@ fn get_displays(serial: &str) -> Vec<(u32, u64)> {
         )
     });
     let mut logical_to_physical: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-    if let Some(output) = physical_output {
+    if let Some(output) = physical_output.as_ref() {
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines() {
             let line = line.trim();
@@ -738,7 +820,7 @@ fn get_displays(serial: &str) -> Vec<(u32, u64)> {
     }
 
     // Get logical display IDs from dumpsys display
-    let mut logical_ids: Vec<u32> = if let Some(output) = logical_output {
+    let mut logical_ids: Vec<u32> = if let Some(output) = logical_output.as_ref() {
         let text = String::from_utf8_lossy(&output.stdout);
         text.lines()
             .filter_map(|l| {
@@ -756,21 +838,30 @@ fn get_displays(serial: &str) -> Vec<(u32, u64)> {
     logical_ids.sort();
     logical_ids.dedup();
     if logical_ids.is_empty() {
+        eprintln!("[uiviewer] get_displays: {serial}: no logical display ids, using [(0,0)]");
         return vec![(0, 0)];
     }
-    logical_ids.into_iter().map(|log| {
+    let result: Vec<(u32, u64)> = logical_ids.into_iter().map(|log| {
         let phys = logical_to_physical.get(&log).copied().unwrap_or(0);
         (log, phys)
-    }).collect()
+    }).collect();
+    eprintln!(
+        "[uiviewer] get_displays: {serial}: phys_ok={} log_ok={} -> {:?}",
+        physical_output.is_some(),
+        logical_output.is_some(),
+        result
+    );
+    result
 }
 
 fn fetch_device_refresh(current_serial: Option<String>, current_devices: Vec<String>) -> DeviceRefresh {
     let mut devices = Vec::new();
     // On timeout/failure keep the current device list instead of clearing it,
     // so a transient adb hiccup doesn't wipe the dropdown selection.
-    let devices_ok = match adb_output_bounded(&["devices"], REFRESH_ADB_TIMEOUT) {
+    let (devices_ok, diag) = match adb_output_bounded(&["devices"], REFRESH_ADB_TIMEOUT) {
         Some(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
+            let diag = format!("adb devices OK, {} lines", text.lines().count());
             for line in text.lines().skip(1) {
                 if let Some(serial) = line.split('\t').next() {
                     if !serial.is_empty() && line.contains("\tdevice") {
@@ -778,11 +869,19 @@ fn fetch_device_refresh(current_serial: Option<String>, current_devices: Vec<Str
                     }
                 }
             }
-            true
+            (true, diag)
         }
-        // Timeout or non-zero exit: keep the current list rather than clearing it.
-        _ => false,
+        Some(out) => (
+            false,
+            format!(
+                "adb devices status={:?} stdout={:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout)
+            ),
+        ),
+        None => (false, "adb devices timed out (3s) or spawn failed".into()),
     };
+    eprintln!("[uiviewer] scan: {diag} -> devices={devices:?}");
     let target = current_serial
         .as_ref()
         .filter(|s| devices.iter().any(|d| d == *s))
@@ -797,6 +896,7 @@ fn fetch_device_refresh(current_serial: Option<String>, current_devices: Vec<Str
         devices: if devices_ok { devices } else { current_devices },
         selected: target,
         displays,
+        diag: Some(diag),
     }
 }
 
@@ -1370,6 +1470,10 @@ impl App {
                 return;
             }
         }
+        eprintln!(
+            "[uiviewer] refresh_devices: force={force} last={:?}",
+            self.last_adb_check
+        );
         self.last_adb_check = Some(now);
         let current = self.selected_device.clone();
         let current_devices = self.adb_devices.clone();
@@ -1392,6 +1496,10 @@ impl App {
                 self.refresh_rx = None;
                 self.refresh_start = None;
                 self.manual_refreshing = false;
+                if let Some(d) = &result.diag {
+                    self.status_message = Some(format!("[refresh] {d}"));
+                    self.status_is_error = true;
+                }
                 self.adb_devices = result.devices;
                 if !self.adb_devices.contains(&self.selected_device.as_deref().unwrap_or_default().to_string()) {
                     // Active device disappeared: fall back to the first one and
@@ -1417,11 +1525,16 @@ impl App {
                         }
                     }
                 }
+                eprintln!(
+                    "[uiviewer] poll_device_refresh: devices={:?} selected={:?} displays={:?}",
+                    self.adb_devices, self.selected_device, self.available_displays
+                );
             }
             Some(Err(mpsc::TryRecvError::Empty)) => {
                 if let Some(start) = self.refresh_start {
                     if start.elapsed() >= REFRESH_TIMEOUT {
                         // Abandon the hung refresh so it can't block future ones forever.
+                        eprintln!("[uiviewer] poll_device_refresh: refresh abandoned ({}s)", REFRESH_TIMEOUT.as_secs());
                         self.refresh_rx = None;
                         self.refresh_start = None;
                         self.manual_refreshing = false;
@@ -1434,6 +1547,7 @@ impl App {
                 }
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                eprintln!("[uiviewer] poll_device_refresh: refresh thread disconnected");
                 self.refresh_rx = None;
                 self.refresh_start = None;
                 self.manual_refreshing = false;
@@ -1444,11 +1558,13 @@ impl App {
 
     fn start_capture(&mut self, ctx: &egui::Context, method: CaptureMethod) {
         if self.capturing {
+            eprintln!("[uiviewer] start_capture: already capturing, ignored");
             return;
         }
         let serial = match self.selected_device.clone() {
             Some(s) => s,
             None => {
+                eprintln!("[uiviewer] start_capture: no device selected, aborting");
                 self.status_message = Some("No device selected — connect a device and ensure it appears in the dropdown".into());
                 self.status_is_error = true;
                 // A capture that can't start is a capture failure: stop auto-
@@ -1459,6 +1575,10 @@ impl App {
             }
         };
 
+        eprintln!(
+            "[uiviewer] start_capture: method={:?} serial={serial} display_id={}",
+            method, self.display_id
+        );
         self.capturing = true;
         self.capture_start = Some(Instant::now());
         self.status_message = Some("Capturing...".into());
@@ -1526,6 +1646,7 @@ impl App {
                     // Receiver dropped (app exited mid-capture): the fresh temps
                     // were disarmed from this thread's TempGuard, so remove them
                     // here to avoid leaving orphan files in the temp dir.
+                    eprintln!("[uiviewer] capture thread: receiver dropped");
                     if let Ok((png, xml, _)) = result {
                         let _ = std::fs::remove_file(&png);
                         let _ = std::fs::remove_file(&xml);
@@ -1558,6 +1679,7 @@ impl App {
                             // temp files (see SendError arm in start_capture). Also kill
                             // the u2.jar server so a zombie U2V3 thread's in-flight HTTP
                             // calls fail fast instead of hitting a newer capture's server.
+                            eprintln!("[uiviewer] poll_capture: capture timed out after {elapsed:?}");
                             stop_u2v3();
                             self.capture_rx = None;
                             self.capturing = false;
@@ -1580,6 +1702,7 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     // Thread ended without sending (e.g. panic): kill any orphaned
                     // u2.jar server left behind by a U2V3 capture thread.
+                    eprintln!("[uiviewer] poll_capture: capture thread disconnected (panic?)");
                     stop_u2v3();
                     self.capture_rx = None;
                     self.capturing = false;
@@ -1651,6 +1774,7 @@ impl App {
                 }
             }
             Err(e) => {
+                eprintln!("[uiviewer] poll_capture: {label} capture FAILED: {e}");
                 self.in_flight_screenshot = None;
                 self.in_flight_xml = None;
                 self.temp_screenshot = old_png;
