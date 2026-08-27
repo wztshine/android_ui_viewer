@@ -42,7 +42,7 @@ const U2V3_MAIN_CLASS: &str = "com.wetest.uia2.Main";
 const DEVICE_DUMP: &str = "/sdcard/uiviewer_dump.xml";
 const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-const REFRESH_ADB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const REFRESH_ADB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 // HTTP read timeout for JSON-RPC calls (takeScreenshot can take seconds).
 const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1339,13 +1339,18 @@ impl App {
         }
     }
 
-    fn refresh_devices(&mut self, ctx: &egui::Context) {
+    fn refresh_devices(&mut self, ctx: &egui::Context, force: bool) {
         let now = Instant::now();
-        if self.last_adb_check.is_some_and(|t| now - t < std::time::Duration::from_secs(15)) {
-            return;
-        }
-        if self.refresh_rx.is_some() {
-            return;
+        // Auto refresh is rate-limited and never overlaps an in-flight scan.
+        // A forced (manual) refresh bypasses both so the user can re-scan at
+        // any time, even while a previous scan is still running.
+        if !force {
+            if self.last_adb_check.is_some_and(|t| now - t < std::time::Duration::from_secs(15)) {
+                return;
+            }
+            if self.refresh_rx.is_some() {
+                return;
+            }
         }
         self.last_adb_check = Some(now);
         let current = self.selected_device.clone();
@@ -1650,7 +1655,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.capturing {
-            self.refresh_devices(&ctx);
+            self.refresh_devices(&ctx, false);
         }
         self.poll_device_refresh(&ctx);
         self.poll_capture(&ctx);
@@ -1849,8 +1854,12 @@ impl eframe::App for App {
                     }
                 }
                 if ui.button("🔄 Refresh device").clicked() {
-                    self.last_adb_check = None;
-                    self.refresh_devices(&ctx);
+                    // Force: abandon any in-flight scan (dropping the receiver
+                    // makes its send fail harmlessly; the thread self-cleans)
+                    // and bypass the rate limit so every click scans now.
+                    self.refresh_rx = None;
+                    self.refresh_start = None;
+                    self.refresh_devices(&ctx, true);
                 }
                 if !self.adb_devices.is_empty() {
                     let current = self.selected_device.clone().unwrap_or_default();
