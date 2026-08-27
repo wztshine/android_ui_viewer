@@ -32,6 +32,47 @@ fn next_temp_id() -> u64 {
     TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+// Log file path: <current working dir>/uiviewer.log. The app detaches from the
+// console (FreeConsole) on Windows, so eprintln goes nowhere there; a file log
+// next to the executable keeps the [uiviewer] diagnostics observable.
+fn uiviewer_log_path() -> PathBuf {
+    PathBuf::from("uiviewer.log")
+}
+
+// Fixed cap for the log file: once exceeded the file is truncated and reuse
+// starts from the top, so it can never grow unbounded.
+const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+// Shared guard so concurrent background-thread log calls append atomically.
+static LOG_MUTEX: Mutex<()> = Mutex::new(());
+
+// Append a line to the log file, truncating it first if it has reached
+// LOG_MAX_BYTES (fixed-size overwrite). Best-effort: never panics, a failure
+// to open/write the log must not break the app.
+fn append_log(msg: &str) {
+    let _g = LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let path = uiviewer_log_path();
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= LOG_MAX_BYTES {
+        let _ = std::fs::File::create(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+// Log a message to stderr AND append it to the log file.
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        eprintln!($($arg)*);
+        append_log(&format!($($arg)*));
+    }};
+}
+
 const U2V3_ADDR: &str = "127.0.0.1:9008";
 const U2V3_FORWARD: &str = "tcp:9008";
 const U2V3_JAR: &str = "/data/local/tmp/u2.jar";
@@ -706,7 +747,7 @@ fn adb_output_bounded(args: &[&str], timeout: std::time::Duration) -> Option<std
     let file = match std::fs::File::create(&tmp) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("[uiviewer] adb_output_bounded: create temp file {:?} failed: {e}", tmp);
+            log!("[uiviewer] adb_output_bounded: create temp file {:?} failed: {e}", tmp);
             return None;
         }
     };
@@ -718,7 +759,7 @@ fn adb_output_bounded(args: &[&str], timeout: std::time::Duration) -> Option<std
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[uiviewer] adb_output_bounded: spawn `adb {:?}` failed: {e}", args);
+            log!("[uiviewer] adb_output_bounded: spawn `adb {:?}` failed: {e}", args);
             let _ = std::fs::remove_file(&tmp);
             return None;
         }
@@ -735,7 +776,7 @@ fn adb_output_bounded(args: &[&str], timeout: std::time::Duration) -> Option<std
                     // Detach the child to a reaper thread instead: it finishes
                     // on its own and the temp file is removed once its handle
                     // is released.
-                    eprintln!(
+                    log!(
                         "[uiviewer] adb_output_bounded: `adb {:?}` timed out after {:?}; detaching",
                         args, timeout
                     );
@@ -749,7 +790,7 @@ fn adb_output_bounded(args: &[&str], timeout: std::time::Duration) -> Option<std
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(e) => {
-                eprintln!("[uiviewer] adb_output_bounded: try_wait `adb {:?}` error: {e}", args);
+                log!("[uiviewer] adb_output_bounded: try_wait `adb {:?}` error: {e}", args);
                 // try_wait error: same policy, let the client finish on its own
                 // rather than risking a corrupted adb server for other tools.
                 let tmp2 = tmp.clone();
@@ -763,7 +804,7 @@ fn adb_output_bounded(args: &[&str], timeout: std::time::Duration) -> Option<std
     };
     let stdout = std::fs::read(&tmp).unwrap_or_default();
     let _ = std::fs::remove_file(&tmp);
-    eprintln!(
+    log!(
         "[uiviewer] adb_output_bounded: `adb {:?}` ok status={:?} stdout={} bytes",
         args,
         status,
@@ -838,14 +879,14 @@ fn get_displays(serial: &str) -> Vec<(u32, u64)> {
     logical_ids.sort();
     logical_ids.dedup();
     if logical_ids.is_empty() {
-        eprintln!("[uiviewer] get_displays: {serial}: no logical display ids, using [(0,0)]");
+        log!("[uiviewer] get_displays: {serial}: no logical display ids, using [(0,0)]");
         return vec![(0, 0)];
     }
     let result: Vec<(u32, u64)> = logical_ids.into_iter().map(|log| {
         let phys = logical_to_physical.get(&log).copied().unwrap_or(0);
         (log, phys)
     }).collect();
-    eprintln!(
+    log!(
         "[uiviewer] get_displays: {serial}: phys_ok={} log_ok={} -> {:?}",
         physical_output.is_some(),
         logical_output.is_some(),
@@ -881,7 +922,7 @@ fn fetch_device_refresh(current_serial: Option<String>, current_devices: Vec<Str
         ),
         None => (false, "adb devices timed out (3s) or spawn failed".into()),
     };
-    eprintln!("[uiviewer] scan: {diag} -> devices={devices:?}");
+    log!("[uiviewer] scan: {diag} -> devices={devices:?}");
     let target = current_serial
         .as_ref()
         .filter(|s| devices.iter().any(|d| d == *s))
@@ -1335,7 +1376,7 @@ impl App {
                 self.screenshot_path = Some(path.to_path_buf());
             }
             Err(e) => {
-                eprintln!("Failed to load screenshot: {e}");
+                log!("Failed to load screenshot: {e}");
             }
         }
         self.screenshot_dir = dir.clone();
@@ -1370,20 +1411,20 @@ impl App {
                     self.parsed_tree_display_id = self.tree_display_id;
                     self.root_node = parse_windows_xml(&content, self.tree_display_id);
                     if self.root_node.is_none() {
-                        eprintln!("Failed to parse --windows XML for display {}", self.tree_display_id);
+                        log!("Failed to parse --windows XML for display {}", self.tree_display_id);
                     }
                 } else {
                     self.file_displays.clear();
                     self.file_xml_content = None;
                     self.root_node = parse_xml(&content);
                     if self.root_node.is_none() {
-                        eprintln!("Failed to parse XML — invalid format?");
+                        log!("Failed to parse XML — invalid format?");
                     }
                 }
                 self.xml_path = Some(path.to_path_buf());
             }
             Err(e) => {
-                eprintln!("Failed to read XML: {e}");
+                log!("Failed to read XML: {e}");
             }
         }
         self.xml_dir = dir.clone();
@@ -1470,7 +1511,7 @@ impl App {
                 return;
             }
         }
-        eprintln!(
+        log!(
             "[uiviewer] refresh_devices: force={force} last={:?}",
             self.last_adb_check
         );
@@ -1525,7 +1566,7 @@ impl App {
                         }
                     }
                 }
-                eprintln!(
+                log!(
                     "[uiviewer] poll_device_refresh: devices={:?} selected={:?} displays={:?}",
                     self.adb_devices, self.selected_device, self.available_displays
                 );
@@ -1534,7 +1575,7 @@ impl App {
                 if let Some(start) = self.refresh_start {
                     if start.elapsed() >= REFRESH_TIMEOUT {
                         // Abandon the hung refresh so it can't block future ones forever.
-                        eprintln!("[uiviewer] poll_device_refresh: refresh abandoned ({}s)", REFRESH_TIMEOUT.as_secs());
+                        log!("[uiviewer] poll_device_refresh: refresh abandoned ({}s)", REFRESH_TIMEOUT.as_secs());
                         self.refresh_rx = None;
                         self.refresh_start = None;
                         self.manual_refreshing = false;
@@ -1547,7 +1588,7 @@ impl App {
                 }
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                eprintln!("[uiviewer] poll_device_refresh: refresh thread disconnected");
+                log!("[uiviewer] poll_device_refresh: refresh thread disconnected");
                 self.refresh_rx = None;
                 self.refresh_start = None;
                 self.manual_refreshing = false;
@@ -1558,13 +1599,13 @@ impl App {
 
     fn start_capture(&mut self, ctx: &egui::Context, method: CaptureMethod) {
         if self.capturing {
-            eprintln!("[uiviewer] start_capture: already capturing, ignored");
+            log!("[uiviewer] start_capture: already capturing, ignored");
             return;
         }
         let serial = match self.selected_device.clone() {
             Some(s) => s,
             None => {
-                eprintln!("[uiviewer] start_capture: no device selected, aborting");
+                log!("[uiviewer] start_capture: no device selected, aborting");
                 self.status_message = Some("No device selected — connect a device and ensure it appears in the dropdown".into());
                 self.status_is_error = true;
                 // A capture that can't start is a capture failure: stop auto-
@@ -1575,7 +1616,7 @@ impl App {
             }
         };
 
-        eprintln!(
+        log!(
             "[uiviewer] start_capture: method={:?} serial={serial} display_id={}",
             method, self.display_id
         );
@@ -1646,7 +1687,7 @@ impl App {
                     // Receiver dropped (app exited mid-capture): the fresh temps
                     // were disarmed from this thread's TempGuard, so remove them
                     // here to avoid leaving orphan files in the temp dir.
-                    eprintln!("[uiviewer] capture thread: receiver dropped");
+                    log!("[uiviewer] capture thread: receiver dropped");
                     if let Ok((png, xml, _)) = result {
                         let _ = std::fs::remove_file(&png);
                         let _ = std::fs::remove_file(&xml);
@@ -1679,7 +1720,7 @@ impl App {
                             // temp files (see SendError arm in start_capture). Also kill
                             // the u2.jar server so a zombie U2V3 thread's in-flight HTTP
                             // calls fail fast instead of hitting a newer capture's server.
-                            eprintln!("[uiviewer] poll_capture: capture timed out after {elapsed:?}");
+                            log!("[uiviewer] poll_capture: capture timed out after {elapsed:?}");
                             stop_u2v3();
                             self.capture_rx = None;
                             self.capturing = false;
@@ -1702,7 +1743,7 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     // Thread ended without sending (e.g. panic): kill any orphaned
                     // u2.jar server left behind by a U2V3 capture thread.
-                    eprintln!("[uiviewer] poll_capture: capture thread disconnected (panic?)");
+                    log!("[uiviewer] poll_capture: capture thread disconnected (panic?)");
                     stop_u2v3();
                     self.capture_rx = None;
                     self.capturing = false;
@@ -1774,7 +1815,7 @@ impl App {
                 }
             }
             Err(e) => {
-                eprintln!("[uiviewer] poll_capture: {label} capture FAILED: {e}");
+                log!("[uiviewer] poll_capture: {label} capture FAILED: {e}");
                 self.in_flight_screenshot = None;
                 self.in_flight_xml = None;
                 self.temp_screenshot = old_png;
