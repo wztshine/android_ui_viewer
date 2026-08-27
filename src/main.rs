@@ -2455,8 +2455,8 @@ fn main() -> eframe::Result<()> {
         // After FreeConsole the standard handles are left dangling (still
         // pointing at the freed console), so Command::spawn (which inherits
         // stdin by default) would fail with os error 50 / ERROR_NOT_SUPPORTED.
-        // Reset them to INVALID_HANDLE_VALUE first — the same workaround as
-        // rust-lang/rust#100884 and #113277.
+        // Reset them to NULL first — the same workaround as rust-lang/rust
+        // #100884 and #113277.
         extern "system" {
             fn FreeConsole() -> i32;
             fn SetStdHandle(n_std_handle: u32, handle: *mut core::ffi::c_void) -> i32;
