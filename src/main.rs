@@ -279,7 +279,6 @@ struct App {
     keep_monitor: bool,
     monitor_interval_secs: f64,
     next_auto_capture: Option<Instant>,
-    capture_source_auto: bool,
     monitor_xml_hash: Option<u64>,
     monitor_probe_count: u32,
     monitor_probe_rx: Option<mpsc::Receiver<Option<u64>>>,
@@ -355,7 +354,6 @@ impl Default for App {
             keep_monitor: false,
             monitor_interval_secs: 3.0,
             next_auto_capture: None,
-            capture_source_auto: false,
             monitor_xml_hash: None,
             monitor_probe_count: 0,
             monitor_probe_rx: None,
@@ -1263,7 +1261,12 @@ impl App {
                 self.file_displays = get_display_ids_from_xml(&content);
                 if !self.file_displays.is_empty() {
                     self.file_xml_content = Some(content.clone());
-                    self.tree_display_id = self.file_displays[0];
+                    // Respect the current tree-display selection whenever it
+                    // still exists in the freshly loaded/captured dump; only
+                    // fall back to the first display when it does not.
+                    if !self.file_displays.contains(&self.tree_display_id) {
+                        self.tree_display_id = self.file_displays[0];
+                    }
                     self.parsed_tree_display_id = self.tree_display_id;
                     self.root_node = parse_windows_xml(&content, self.tree_display_id);
                     if self.root_node.is_none() {
@@ -1615,14 +1618,6 @@ impl App {
                 }
                 self.load_screenshot(&png, ctx);
                 self.load_xml(&xml, ctx);
-                // Deliberately leave parsed_tree_display_id stale: when the dump covers
-                // multiple displays, ui()'s re-parse guard then re-parses the XML for
-                // the freshly captured display instead of file_displays[0].
-                // Monitor-driven captures respect the user's tree-display
-                // selection and never retarget it.
-                if !self.capture_source_auto {
-                    self.tree_display_id = self.display_id;
-                }
                 // Refresh the keep-monitor change-detection baseline from this
                 // fresh dump (also covers settle recaptures made during
                 // monitoring), so the next probe compares against what is on
@@ -1709,7 +1704,6 @@ impl eframe::App for App {
                 self.tap_settle_start = None;
                 // Settle recaptures are user-driven feedback (tap/swipe result),
                 // not monitor ticks.
-                self.capture_source_auto = false;
                 match self.last_capture {
                     Some(CaptureMethod::Adb) => self.start_capture(&ctx, CaptureMethod::Adb),
                     Some(CaptureMethod::U2V3) => self.start_capture(&ctx, CaptureMethod::U2V3),
@@ -1760,7 +1754,6 @@ impl eframe::App for App {
                                 self.monitor_xml_hash = Some(h);
                             }
                             if fire {
-                                self.capture_source_auto = true;
                                 self.next_auto_capture = None;
                                 let method = self.last_capture.unwrap_or(CaptureMethod::Adb);
                                 self.start_capture(&ctx, method);
@@ -1806,7 +1799,6 @@ impl eframe::App for App {
                                 let _ = tx.send(probe_u2_hierarchy_hash());
                             });
                         } else {
-                            self.capture_source_auto = true;
                             self.next_auto_capture = None;
                             self.start_capture(&ctx, method);
                         }
@@ -1909,6 +1901,7 @@ impl eframe::App for App {
                 }
                 if !self.adb_devices.is_empty() {
                     let current_disp = format!("Disp {}", self.display_id);
+                    let prev_disp = self.display_id;
                     ui.add_enabled_ui(!self.capturing, |ui| {
                         egui::ComboBox::from_id_salt("display_selector")
                             .selected_text(&current_disp)
@@ -1920,6 +1913,10 @@ impl eframe::App for App {
                                 }
                             });
                     });
+                    // Re-selecting the top display always moves the tree along.
+                    if self.display_id != prev_disp {
+                        self.tree_display_id = self.display_id;
+                    }
                 }
                 ui.separator();
                 // Keep-monitor switch: auto-capture with the last used method
@@ -1959,12 +1956,10 @@ impl eframe::App for App {
                 }
                 if ui.add_enabled(!self.capturing && !self.keep_monitor, egui::Button::new("📱 ADB Capture")).clicked() {
                     self.last_capture = Some(CaptureMethod::Adb);
-                    self.capture_source_auto = false;
                     self.start_capture(&ctx, CaptureMethod::Adb);
                 }
                 if ui.add_enabled(!self.capturing && !self.keep_monitor, egui::Button::new("⚡ u2 Capture")).clicked() {
                     self.last_capture = Some(CaptureMethod::U2V3);
-                    self.capture_source_auto = false;
                     self.start_capture(&ctx, CaptureMethod::U2V3);
                 }
                 if ui.add_enabled(!self.capturing, egui::Button::new("💾 Save")).clicked() {
