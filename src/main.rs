@@ -345,6 +345,12 @@ struct App {
     refresh_rx: Option<mpsc::Receiver<DeviceRefresh>>,
     refresh_start: Option<Instant>,
     manual_refreshing: bool,
+    // Incremented whenever root_node is re-parsed, so the per-node XPath cache
+    // can be invalidated on tree changes.
+    tree_revision: u64,
+    // (tree_revision, displayed path, computed XPath) cache: hovering repaints
+    // share the same path, avoiding a full-tree XPath uniqueness walk per frame.
+    xpath_cache: Option<(u64, Vec<usize>, Option<String>)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -422,6 +428,8 @@ impl Default for App {
             refresh_rx: None,
             refresh_start: None,
             manual_refreshing: false,
+            tree_revision: 0,
+            xpath_cache: None,
         }
     }
 }
@@ -613,6 +621,186 @@ fn load_texture(path: &Path, ctx: &egui::Context) -> Result<(TextureHandle, Vec2
     );
     let tex = ctx.load_texture("screenshot", color_image, TextureOptions::default());
     Ok((tex, size))
+}
+
+// Default file name for an exported element icon: the resource-id's last
+// segment, else the class's simple name, else "icon". Sanitized for use in
+// file names (non-alphanumeric chars become '_').
+fn export_icon_name(node: &UiNode) -> String {
+    let stem = node
+        .attrs
+        .iter()
+        .find(|(k, _)| k == "resource-id")
+        .and_then(|(_, v)| v.rsplit('/').next())
+        .filter(|v| !v.is_empty() && *v != "null")
+        .or_else(|| {
+            node.attrs
+                .iter()
+                .find(|(k, _)| k == "class")
+                .and_then(|(_, v)| v.rsplit('.').next())
+        })
+        .unwrap_or("icon");
+    let stem: String = stem
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let stem = if stem.is_empty() { "icon".to_string() } else { stem };
+    format!("{stem}.png")
+}
+
+// Crop the `bounds` region out of the screenshot image and save it as PNG.
+// The region is clamped to the image dimensions (child bounds can exceed their
+// parent's), and an empty region after clamping is an error, never a panic.
+fn crop_screenshot(src: &Path, bounds: Rect, out: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(src).map_err(|e| format!("open screenshot: {e}"))?;
+    let img = image::ImageReader::new(std::io::BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|e| format!("guess image format: {e}"))?
+        .decode()
+        .map_err(|e| format!("decode screenshot: {e}"))?;
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let x0 = bounds.min.x.clamp(0.0, w).floor() as u32;
+    let y0 = bounds.min.y.clamp(0.0, h).floor() as u32;
+    let x1 = bounds.max.x.clamp(0.0, w).ceil() as u32;
+    let y1 = bounds.max.y.clamp(0.0, h).ceil() as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return Err(format!(
+            "element bounds [{x0},{y0}][{x1},{y1}] fall outside the image {w:.0}x{h:.0}"
+        ));
+    }
+    let cropped = img.crop_imm(x0, y0, x1 - x0, y1 - y0);
+    cropped.save(out).map_err(|e| format!("encode icon: {e}"))
+}
+
+// Attribute value helper: return the value for `key` if present and not a
+// placeholder ("null" or empty).
+fn node_attr<'a>(node: &'a UiNode, key: &str) -> Option<&'a str> {
+    node.attrs
+        .iter()
+        .find(|(a, _)| a == key)
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty() && *v != "null")
+}
+
+// Check whether `node`'s attributes satisfy every required (attr, value) pair.
+fn node_matches_attrs(node: &UiNode, preds: &[(&str, &str)]) -> bool {
+    preds.iter()
+        .all(|(k, v)| node.attrs.iter().any(|(a, av)| a == k && av == v))
+}
+
+// Count nodes in the tree satisfying `preds`, capped at 2: uniqueness is all
+// we care about, so a non-unique candidate short-circuits at 2 matches.
+fn count_matches(root: &UiNode, preds: &[(&str, &str)]) -> u32 {
+    fn walk(node: &UiNode, preds: &[(&str, &str)], count: &mut u32) {
+        if *count >= 2 {
+            return;
+        }
+        if node_matches_attrs(node, preds) {
+            *count += 1;
+        }
+        for c in &node.children {
+            walk(c, preds, count);
+            if *count >= 2 {
+                return;
+            }
+        }
+    }
+    let mut count = 0;
+    walk(root, preds, &mut count);
+    count
+}
+
+// Render a uiautomator-style XPath from ordered (attr, value) predicates.
+fn build_xpath_str(preds: &[(&str, &str)]) -> String {
+    let mut s = String::from("//*");
+    for (k, v) in preds {
+        use std::fmt::Write;
+        write!(s, "[@{k}='{v}']").ok();
+    }
+    s
+}
+
+// XPath 1.0 string literals have no escape sequence: a single quote inside a
+// `'...'` literal is the one character that breaks the syntax, and control
+// characters (newlines, tabs) make the expression hard to read or embed.
+// Rejecting such values guarantees every generated XPath is well-formed.
+fn xpath_literal_safe(v: &str) -> bool {
+    !v.contains('\'') && !v.chars().any(char::is_control)
+}
+
+// Generate a unique page-level XPath for `node` within `root`. text and
+// resource-id are prioritized (in that order), followed by content-desc and
+// class combinations; state predicates (checked/selected) are appended only
+// when the plain attribute combinations are not unique, mirroring the
+// `[@selected='true']` / `[@checked='false']` style. Returns None when no
+// candidate matches exactly one node — callers leave the value empty.
+fn generate_xpath(node: &UiNode, root: &UiNode) -> Option<String> {
+    // Values that would break the XPath literal syntax are skipped entirely.
+    let t = node_attr(node, "text").filter(|v| xpath_literal_safe(v));
+    let r = node_attr(node, "resource-id").filter(|v| xpath_literal_safe(v));
+    let d = node_attr(node, "content-desc").filter(|v| xpath_literal_safe(v));
+    let c = node_attr(node, "class").filter(|v| xpath_literal_safe(v));
+
+    // State predicates used as a last-resort disambiguator.
+    let mut state: Vec<(&str, &str)> = Vec::new();
+    for k in ["checked", "selected"] {
+        if let Some(v) = node_attr(node, k).filter(|v| xpath_literal_safe(v)) {
+            state.push((k, v));
+        }
+    }
+
+    // Identity-attribute candidates, most preferred first. Every candidate is
+    // guaranteed to match `node` itself, so the walk always finds >= 1 match;
+    // non-unique candidates short-circuit at 2.
+    let mut base: Vec<Vec<(&str, &str)>> = Vec::new();
+    if let Some(t) = t {
+        base.push(vec![("text", t)]);
+    }
+    if let Some(r) = r {
+        base.push(vec![("resource-id", r)]);
+    }
+    if let Some(d) = d {
+        base.push(vec![("content-desc", d)]);
+    }
+    if let (Some(r), Some(t)) = (r, t) {
+        base.push(vec![("resource-id", r), ("text", t)]);
+    }
+    if let (Some(c), Some(t)) = (c, t) {
+        base.push(vec![("class", c), ("text", t)]);
+    }
+    if let (Some(c), Some(r)) = (c, r) {
+        base.push(vec![("class", c), ("resource-id", r)]);
+    }
+    if let (Some(r), Some(d)) = (r, d) {
+        base.push(vec![("resource-id", r), ("content-desc", d)]);
+    }
+    if let (Some(c), Some(r), Some(d)) = (c, r, d) {
+        base.push(vec![("class", c), ("resource-id", r), ("content-desc", d)]);
+    }
+
+    for preds in &base {
+        if count_matches(root, preds) == 1 {
+            return Some(build_xpath_str(preds));
+        }
+    }
+    // State predicates as a last resort (e.g. identical rows/checkboxes).
+    if !state.is_empty() {
+        for preds in &base {
+            let mut extended = preds.clone();
+            extended.extend(state.iter().copied());
+            if count_matches(root, &extended) == 1 {
+                return Some(build_xpath_str(&extended));
+            }
+        }
+        if let Some(c) = c {
+            let mut cand = vec![("class", c)];
+            cand.extend(state.iter().copied());
+            if count_matches(root, &cand) == 1 {
+                return Some(build_xpath_str(&cand));
+            }
+        }
+    }
+    None
 }
 
 fn get_display_ids_from_xml(text: &str) -> Vec<u32> {
@@ -1415,6 +1603,7 @@ impl App {
                     }
                     self.parsed_tree_display_id = self.tree_display_id;
                     self.root_node = parse_windows_xml(&content, self.tree_display_id);
+                    self.tree_revision += 1;
                     if self.root_node.is_none() {
                         log!("Failed to parse --windows XML for display {}", self.tree_display_id);
                     }
@@ -1422,6 +1611,7 @@ impl App {
                     self.file_displays.clear();
                     self.file_xml_content = None;
                     self.root_node = parse_xml(&content);
+                    self.tree_revision += 1;
                     if self.root_node.is_none() {
                         log!("Failed to parse XML — invalid format?");
                     }
@@ -1498,6 +1688,50 @@ impl App {
                 self.status_is_error = false;
             } else {
                 self.status_message = Some("Failed to save files".into());
+                self.status_is_error = true;
+            }
+        }
+    }
+
+    // Export the selected element's bounds region from the screenshot as a
+    // small PNG icon. No-op when the user cancels the save dialog.
+    fn export_icon(&mut self) {
+        let screenshot = match self.screenshot_path.clone() {
+            Some(p) => p,
+            None => {
+                self.status_message = Some("No screenshot loaded".into());
+                self.status_is_error = true;
+                return;
+            }
+        };
+        let node = self
+            .selected_path
+            .as_ref()
+            .and_then(|p| self.root_node.as_ref()?.node_at(p));
+        let node = match node {
+            Some(n) => n,
+            None => {
+                self.status_message = Some("No element selected".into());
+                self.status_is_error = true;
+                return;
+            }
+        };
+        let mut dialog = rfd::FileDialog::new().set_file_name(export_icon_name(node));
+        if let Some(ref dir) = self.screenshot_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(save_path) = dialog.save_file() else { return };
+        let out = save_path.with_extension("png");
+        match crop_screenshot(&screenshot, node.bounds, &out) {
+            Ok(()) => {
+                self.status_message = Some(format!(
+                    "Icon saved as {}",
+                    out.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                self.status_is_error = false;
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Export failed: {e}"));
                 self.status_is_error = true;
             }
         }
@@ -1998,6 +2232,7 @@ impl eframe::App for App {
             self.parsed_tree_display_id = self.tree_display_id;
             if let Some(content) = self.file_xml_content.as_deref() {
                 self.root_node = parse_windows_xml(content, self.tree_display_id);
+                self.tree_revision += 1;
                 self.selected_path = None;
                 self.expanded.clear();
             }
@@ -2251,7 +2486,18 @@ impl eframe::App for App {
             self.expanded = expanded;
 
             ui.separator();
-            ui.heading("Properties");
+            let mut export_requested = false;
+            ui.horizontal(|ui| {
+                ui.heading("Properties");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.selected_path.is_some()
+                        && self.screenshot_path.is_some()
+                        && ui.button("✂️ Export Icon").clicked()
+                    {
+                        export_requested = true;
+                    }
+                });
+            });
             ui.separator();
 
             let target = self
@@ -2260,6 +2506,34 @@ impl eframe::App for App {
                 .or(self.selected_path.as_ref());
             let node = target
                 .and_then(|p| self.root_node.as_ref()?.node_at(p));
+
+            // XPath for the displayed node, cached by (tree revision, displayed
+            // path) so hovering repaints don't re-walk the whole tree every frame.
+            // When nothing is displayed the cache is never written, so an empty
+            // path can't be conflated with the selected root node (path `[]`).
+            let xpath: Option<String> = match target {
+                None => None,
+                Some(path) => {
+                    let displayed = path.to_vec();
+                    match self.xpath_cache.as_ref().and_then(|(rev, cp, val)| {
+                        if *rev == self.tree_revision && cp.as_slice() == displayed.as_slice() {
+                            Some(val.clone())
+                        } else {
+                            None
+                        }
+                    }) {
+                        Some(xp) => xp,
+                        None => {
+                            let val = self.root_node.as_ref().and_then(|r| {
+                                r.node_at(&displayed).and_then(|n| generate_xpath(n, r))
+                            });
+                            self.xpath_cache =
+                                Some((self.tree_revision, displayed, val.clone()));
+                            val
+                        }
+                    }
+                }
+            };
 
             if let Some(node) = node {
                 ui.colored_label(
@@ -2272,6 +2546,16 @@ impl eframe::App for App {
                         node.bounds.max.y,
                     ),
                 );
+                ui.label(egui::RichText::new("XPath:").strong());
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(xpath.as_deref().unwrap_or("")).monospace(),
+                        )
+                        .wrap()
+                        .selectable(true),
+                    );
+                });
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt("props_scroll")
@@ -2304,6 +2588,12 @@ impl eframe::App for App {
                 }
             } else {
                 ui.weak("Hover over an element to inspect");
+            }
+            // Deferred until the `node` borrow above has ended so export_icon
+            // can take &mut self without conflicting with the panel's immutable
+            // borrow of root_node.
+            if export_requested {
+                self.export_icon();
             }
         });
 
@@ -2532,4 +2822,95 @@ fn main() -> eframe::Result<()> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(attrs: &[(&str, &str)]) -> UiNode {
+        UiNode {
+            bounds: Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 10.0)),
+            attrs: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            children: Vec::new(),
+            label: String::new(),
+        }
+    }
+
+    fn root_with(children: Vec<UiNode>) -> UiNode {
+        UiNode {
+            bounds: Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0)),
+            attrs: vec![("class".into(), "android.widget.FrameLayout".into())],
+            children,
+            label: String::new(),
+        }
+    }
+
+    #[test]
+    fn unique_text_yields_text_xpath() {
+        let n = node(&[("class", "android.widget.TextView"), ("text", "设置")]);
+        let xp = generate_xpath(&n, &n).unwrap();
+        assert_eq!(xp, "//*[@text='设置']");
+    }
+
+    #[test]
+    fn duplicated_text_falls_back_to_unique_rid() {
+        let target = node(&[
+            ("class", "android.widget.TextView"),
+            ("text", "设置"),
+            ("resource-id", "com.x:id/title1"),
+        ]);
+        let other = node(&[
+            ("class", "android.widget.TextView"),
+            ("text", "设置"),
+            ("resource-id", "com.x:id/title2"),
+        ]);
+        let root = root_with(vec![target.clone(), other]);
+        assert_eq!(
+            generate_xpath(&target, &root).unwrap(),
+            "//*[@resource-id='com.x:id/title1']"
+        );
+    }
+
+    #[test]
+    fn state_predicates_disambiguate_identical_rows() {
+        let on = node(&[
+            ("class", "android.widget.CheckBox"),
+            ("text", "允许"),
+            ("checked", "true"),
+        ]);
+        let off = node(&[
+            ("class", "android.widget.CheckBox"),
+            ("text", "允许"),
+            ("checked", "false"),
+        ]);
+        let root = root_with(vec![on, off.clone()]);
+        assert_eq!(
+            generate_xpath(&off, &root).unwrap(),
+            "//*[@text='允许'][@checked='false']"
+        );
+    }
+
+    #[test]
+    fn not_unique_yields_none() {
+        let dup = node(&[("class", "android.widget.TextView"), ("text", "设置")]);
+        let root = root_with(vec![dup.clone(), dup]);
+        assert_eq!(generate_xpath(&root.children[0], &root), None);
+    }
+
+    #[test]
+    fn quote_in_value_is_skipped() {
+        let n = node(&[("class", "android.widget.TextView"), ("text", "it's")]);
+        assert_eq!(generate_xpath(&n, &n), None);
+    }
+
+    #[test]
+    fn xpath_literal_safe_rejects_quotes_and_controls() {
+        assert!(!xpath_literal_safe("it's"));
+        assert!(!xpath_literal_safe("a\nb"));
+        assert!(xpath_literal_safe("a<b&c\"d"));
+    }
 }
