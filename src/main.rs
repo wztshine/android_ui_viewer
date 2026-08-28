@@ -81,12 +81,20 @@ const U2V3_PORT: &str = "9008";
 // the pkill cleanup (the CLASSPATH is an env var, so pkill must match this argv).
 const U2V3_MAIN_CLASS: &str = "com.wetest.uia2.Main";
 const DEVICE_DUMP: &str = "/sdcard/uiviewer_dump.xml";
-const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const REFRESH_ADB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 // HTTP read timeout for JSON-RPC calls (takeScreenshot can take seconds).
-const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// Bound to CAPTURE_TIMEOUT: a capture is already abandoned at the capture
+// budget, so a per-request read should never outlive it (otherwise a zombie
+// capture thread lingers up to 30s before its own HTTP read gives up).
+const HTTP_READ_TIMEOUT: std::time::Duration = CAPTURE_TIMEOUT;
+// Short read timeout for keep-monitor probes: a probe that can't answer in
+// time counts as failed and falls back to a full capture. A request that
+// stalls ~2s won't come back at 5s either, and the probe is only a cheap
+// change-detection check, so 2s bounds the UI-static window tightly.
+const PROBE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 // Short read timeout for /ping probes: a single hung probe must not exceed the
 // launch deadline, which is only checked between attempts.
 const U2V3_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -94,6 +102,9 @@ const U2V3_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 // A short interval keeps perceived startup latency close to the actual boot
 // time instead of quantizing it to the poll period (was 500ms).
 const U2V3_PING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+// Settle delay after sending a tap/swipe to the device: wait for the UI to
+// settle before re-capturing, so the recapture reflects the action's result.
+const SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 // Keep-monitor two-tier probing (U2 method): a hierarchy-only RPC is hashed
 // each tick; full captures run only when the hash changed, or every
 // MONITOR_FORCE_REFRESH_EVERY unchanged probes as an eventual-consistency
@@ -102,10 +113,6 @@ const MONITOR_FORCE_REFRESH_EVERY: u32 = 10;
 // FNV-1a 64-bit constants for cheap XML change detection.
 const FNV1A_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
-// Keep-monitor liveness heartbeat (ms): while monitoring, guarantee periodic
-// frames so a missed repaint request anywhere can never freeze the UI until
-// the next input event arrives.
-const MONITOR_HEARTBEAT_MS: u64 = 100;
 // JSON-RPC params: takeScreenshot(display_id, quality) — numeric display id,
 // 0 = primary; returns base64 JPEG. dumpWindowHierarchy(compressed, max_depth)
 // mirrors uiautomator2's dump_hierarchy(compressed=False, max_depth=50).
@@ -1207,6 +1214,14 @@ fn http_request(
 }
 
 fn http_jsonrpc(method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+    http_jsonrpc_with_timeout(method, params, HTTP_READ_TIMEOUT)
+}
+
+fn http_jsonrpc_with_timeout(
+    method: &str,
+    params: &[serde_json::Value],
+    read_timeout: std::time::Duration,
+) -> Result<serde_json::Value, String> {
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1214,7 +1229,7 @@ fn http_jsonrpc(method: &str, params: &[serde_json::Value]) -> Result<serde_json
         "params": params,
     });
     let body = serde_json::to_vec(&payload).map_err(|e| format!("json encode: {e}"))?;
-    let raw = http_request(U2V3_ADDR, "POST", "/jsonrpc/0", Some(&body), HTTP_READ_TIMEOUT)?;
+    let raw = http_request(U2V3_ADDR, "POST", "/jsonrpc/0", Some(&body), read_timeout)?;
     let data: serde_json::Value =
         serde_json::from_slice(&raw).map_err(|e| format!("json decode: {e}"))?;
     if let Some(err) = data.get("error") {
@@ -1339,9 +1354,10 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 // recovers from a transient hiccup or stops monitoring via the normal
 // failure policy.
 fn probe_u2_hierarchy_hash() -> Option<u64> {
-    let raw = http_jsonrpc(
+    let raw = http_jsonrpc_with_timeout(
         "dumpWindowHierarchy",
         &[U2V3_DUMP_COMPRESSED.into(), U2V3_DUMP_MAX_DEPTH.into()],
+        PROBE_READ_TIMEOUT,
     )
         .and_then(|v| {
             v.as_str()
@@ -1443,7 +1459,9 @@ fn launch_u2v3(serial: &str) -> Result<(), String> {
     }
 
     // Poll /ping until the server answers (see u2v3_alive for trimming note).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // The boot wait shares the capture budget so a cold start can never push a
+    // capture past the UI-side CAPTURE_TIMEOUT.
+    let deadline = std::time::Instant::now() + CAPTURE_TIMEOUT;
     while std::time::Instant::now() < deadline {
         if u2v3_alive() {
             return Ok(());
@@ -1451,7 +1469,10 @@ fn launch_u2v3(serial: &str) -> Result<(), String> {
         std::thread::sleep(U2V3_PING_POLL_INTERVAL);
     }
     stop_u2v3_if_current(my_id);
-    Err(format!("{U2V3_JAR} failed to start — server did not answer /ping in 30s"))
+    Err(format!(
+        "{U2V3_JAR} failed to start — server did not answer /ping in {}s",
+        CAPTURE_TIMEOUT.as_secs()
+    ))
 }
 
 // Primary-display screenshot bytes via JSON-RPC takeScreenshot → base64 JPEG
@@ -1503,7 +1524,7 @@ fn fetch_u2_hierarchy() -> Result<Vec<u8>, String> {
     // Retry a few times when the freshly launched server returns an empty
     // hierarchy; the inter-attempt delay runs between tries only, not after
     // the final failed one.
-    const MAX_ATTEMPTS: usize = 3;
+    const MAX_ATTEMPTS: usize = 2;
     for attempt in 0..MAX_ATTEMPTS {
         let raw = http_jsonrpc(
             "dumpWindowHierarchy",
@@ -1556,88 +1577,188 @@ fn uiautomator2_v3_capture(serial: &str, display_id: u32, display_physical: u64,
 }
 
 impl App {
-    fn load_screenshot(&mut self, path: &Path, ctx: &egui::Context) {
-        let dir = path.parent().map(|p| p.to_path_buf());
-        match load_texture(path, ctx) {
-            Ok((tex, _size)) => {
-                // Only discard the previous capture's temp file once the new image
-                // actually loaded, so a failed load keeps the current screenshot usable.
-                if let Some(p) = self.temp_screenshot.take() {
-                    let _ = std::fs::remove_file(&p);
-                }
-                self.screenshot_texture = Some(tex);
-                self.screenshot_path = Some(path.to_path_buf());
+    // Parse XML content into a tree for a display, mirroring load_xml's
+    // multi-display handling without committing any state. Returns
+    // (file_displays, file_xml_content, tree_display_id,
+    //  parsed_tree_display_id, root_node) exactly as load_xml would set them.
+    fn parse_xml_content(
+        content: &str,
+        current_tree_display_id: u32,
+    ) -> (Vec<u32>, Option<String>, u32, u32, Option<UiNode>) {
+        let file_displays = get_display_ids_from_xml(content);
+        if !file_displays.is_empty() {
+            let mut tree_display_id = current_tree_display_id;
+            if !file_displays.contains(&tree_display_id) {
+                tree_display_id = file_displays[0];
             }
-            Err(e) => {
-                log!("Failed to load screenshot: {e}");
-            }
-        }
-        self.screenshot_dir = dir.clone();
-        self.xml_dir = dir;
-        // auto-load paired xml/uix from same directory
-        let paired = path.with_extension("xml");
-        let paired = if paired.exists() { paired } else { path.with_extension("uix") };
-        if paired.exists() && self.xml_path.as_deref() != Some(paired.as_path()) {
-            self.load_xml(&paired, ctx);
+            let parsed_tree_display_id = tree_display_id;
+            let root = parse_windows_xml(content, tree_display_id);
+            (
+                file_displays,
+                Some(content.to_string()),
+                tree_display_id,
+                parsed_tree_display_id,
+                root,
+            )
+        } else {
+            (
+                Vec::new(),
+                None,
+                current_tree_display_id,
+                current_tree_display_id,
+                parse_xml(content),
+            )
         }
     }
 
-    fn load_xml(&mut self, path: &Path, ctx: &egui::Context) {
+    fn load_screenshot(&mut self, path: &Path, ctx: &egui::Context) -> bool {
         let dir = path.parent().map(|p| p.to_path_buf());
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                // Only discard the previous capture's temp file once the new XML
-                // actually loaded, so a failed load keeps the current XML usable.
-                if let Some(p) = self.temp_xml.take() {
-                    let _ = std::fs::remove_file(&p);
-                }
-                // Detect multi-display format: <displays>, or <hierarchy> with <display> children
-                self.file_displays = get_display_ids_from_xml(&content);
-                if !self.file_displays.is_empty() {
-                    self.file_xml_content = Some(content.clone());
-                    // Respect the current tree-display selection whenever it
-                    // still exists in the freshly loaded/captured dump; only
-                    // fall back to the first display when it does not.
-                    if !self.file_displays.contains(&self.tree_display_id) {
-                        self.tree_display_id = self.file_displays[0];
-                    }
-                    self.parsed_tree_display_id = self.tree_display_id;
-                    self.root_node = parse_windows_xml(&content, self.tree_display_id);
-                    self.tree_revision += 1;
-                    if self.root_node.is_none() {
-                        log!("Failed to parse --windows XML for display {}", self.tree_display_id);
-                    }
-                } else {
-                    self.file_displays.clear();
-                    self.file_xml_content = None;
-                    self.root_node = parse_xml(&content);
-                    self.tree_revision += 1;
-                    if self.root_node.is_none() {
-                        log!("Failed to parse XML — invalid format?");
-                    }
-                }
-                self.xml_path = Some(path.to_path_buf());
+        // When a companion XML exists in the same directory, load the pair
+        // atomically (decode once, parse once, commit only when both are
+        // valid) so a broken companion can never leave a mismatched pair.
+        let paired = {
+            let x = path.with_extension("xml");
+            if x.exists() {
+                Some(x)
+            } else {
+                let u = path.with_extension("uix");
+                if u.exists() { Some(u) } else { None }
             }
-            Err(e) => {
-                log!("Failed to read XML: {e}");
+        };
+        let ok = match paired {
+            Some(xml) => self.load_captured_pair(path, &xml, ctx),
+            None => {
+                // No companion: load the screenshot alone, keeping the current tree.
+                match load_texture(path, ctx) {
+                    Ok((tex, _size)) => {
+                        // Only discard the previous capture's temp file once the
+                        // new image actually loaded, so a failed load keeps the
+                        // current screenshot usable.
+                        if let Some(p) = self.temp_screenshot.take() {
+                            let _ = std::fs::remove_file(&p);
+                        }
+                        self.screenshot_texture = Some(tex);
+                        self.screenshot_path = Some(path.to_path_buf());
+                        true
+                    }
+                    Err(e) => {
+                        log!("Failed to load screenshot: {e}");
+                        false
+                    }
+                }
             }
-        }
+        };
+        self.screenshot_dir = dir.clone();
+        self.xml_dir = dir;
+        ok
+    }
+
+    fn load_xml(&mut self, path: &Path, ctx: &egui::Context) -> bool {
+        let dir = path.parent().map(|p| p.to_path_buf());
+        // When a companion screenshot exists in the same directory, load the
+        // pair atomically (see load_captured_pair).
+        let paired = path.file_stem().and_then(|stem| {
+            path.parent().and_then(|dir| {
+                ["png", "jpg", "jpeg"].iter().find_map(|ext| {
+                    let img = dir.join(stem).with_extension(ext);
+                    if img.exists() { Some(img) } else { None }
+                })
+            })
+        });
+        let ok = match paired {
+            Some(png) => self.load_captured_pair(&png, path, ctx),
+            None => {
+                // No companion: load the tree alone, keeping the current screenshot.
+                match std::fs::read_to_string(path) {
+                    Ok(content) => {
+                        let (file_displays, file_xml_content, tree_display_id, parsed_tree_display_id, root) =
+                            Self::parse_xml_content(&content, self.tree_display_id);
+                        match root {
+                            Some(root) => {
+                                // Only discard the previous capture's temp file
+                                // once the new XML actually parsed, so a failed
+                                // load keeps the current XML (and its tree) intact.
+                                if let Some(p) = self.temp_xml.take() {
+                                    let _ = std::fs::remove_file(&p);
+                                }
+                                self.file_displays = file_displays;
+                                self.file_xml_content = file_xml_content;
+                                self.tree_display_id = tree_display_id;
+                                self.parsed_tree_display_id = parsed_tree_display_id;
+                                self.root_node = Some(root);
+                                self.xml_path = Some(path.to_path_buf());
+                                self.tree_revision += 1;
+                                true
+                            }
+                            None => {
+                                log!("Failed to parse XML: {}", path.display());
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log!("Failed to read XML: {e}");
+                        false
+                    }
+                }
+            }
+        };
         self.xml_dir = dir.clone();
         self.screenshot_dir = dir;
-        // auto-load paired screenshot from same directory
-        if let Some(stem) = path.file_stem() {
-            if let Some(dir) = path.parent() {
-                for ext in ["png", "jpg", "jpeg"] {
-                    let img_path = dir.join(stem).with_extension(ext);
-                    if img_path.exists()
-                        && self.screenshot_path.as_deref() != Some(img_path.as_path())
-                    {
-                        self.load_screenshot(&img_path, ctx);
-                        break;
-                    }
-                }
+        ok
+    }
+
+    // Load a screenshot + hierarchy pair atomically, decoding/parsing each file
+    // exactly once. Used by both capture completion and manual loads (whenever
+    // a companion file exists). Returns false without touching any state when
+    // either file is invalid, so a failure never shows a mismatched pair and
+    // the previous UI state stays fully intact.
+    fn load_captured_pair(&mut self, png: &Path, xml: &Path, ctx: &egui::Context) -> bool {
+        let tex = match load_texture(png, ctx) {
+            Ok((tex, _size)) => tex,
+            Err(e) => {
+                log!("[uiviewer] load_captured_pair: decode screenshot failed: {e}");
+                return false;
             }
+        };
+        let content = match std::fs::read_to_string(xml) {
+            Ok(c) => c,
+            Err(e) => {
+                log!("[uiviewer] load_captured_pair: read XML failed: {e}");
+                return false;
+            }
+        };
+        let (file_displays, file_xml_content, tree_display_id, parsed_tree_display_id, root) =
+            Self::parse_xml_content(&content, self.tree_display_id);
+        let root = match root {
+            Some(r) => r,
+            None => {
+                log!("[uiviewer] load_captured_pair: parse XML failed: {}", xml.display());
+                return false;
+            }
+        };
+        // Both files valid — commit. Discard any temp tracked for the files being
+        // replaced (a no-op in the capture path, where the previous temps live
+        // in pending_old_* until the caller removes them).
+        if let Some(p) = self.temp_screenshot.take() {
+            let _ = std::fs::remove_file(&p);
         }
+        self.screenshot_texture = Some(tex);
+        self.screenshot_path = Some(png.to_path_buf());
+        if let Some(p) = self.temp_xml.take() {
+            let _ = std::fs::remove_file(&p);
+        }
+        self.file_displays = file_displays;
+        self.file_xml_content = file_xml_content;
+        self.tree_display_id = tree_display_id;
+        self.parsed_tree_display_id = parsed_tree_display_id;
+        self.root_node = Some(root);
+        self.xml_path = Some(xml.to_path_buf());
+        self.tree_revision += 1;
+        let dir = xml.parent().map(|p| p.to_path_buf());
+        self.screenshot_dir = dir.clone();
+        self.xml_dir = dir;
+        true
     }
 
     fn save_files(&mut self) {
@@ -2012,6 +2133,29 @@ impl App {
 
         match result {
             Ok((png, xml, shot_source)) => {
+                // Load the screenshot and layout as an atomic pair: decode and
+                // parse each file exactly once, then commit both only when both
+                // are valid, so a failure in one never shows a mismatched pair
+                // (the previous screenshot/tree stays fully intact).
+                if !self.load_captured_pair(&png, &xml, ctx) {
+                    log!(
+                        "[uiviewer] capture produced unreadable screenshot/XML — keeping previous pair"
+                    );
+                    // Discard the fresh (invalid) temp files: the capture thread
+                    // already disarmed its TempGuard, and these paths are not
+                    // tracked anywhere after this, so they'd otherwise leak.
+                    let _ = std::fs::remove_file(&png);
+                    let _ = std::fs::remove_file(&xml);
+                    self.temp_screenshot = old_png;
+                    self.temp_xml = old_xml;
+                    self.in_flight_screenshot = None;
+                    self.in_flight_xml = None;
+                    self.status_message =
+                        Some("capture failed: screenshot or layout could not be loaded".into());
+                    self.status_is_error = true;
+                    self.stop_keep_monitor();
+                    return;
+                }
                 // The previous capture's unique temp files are no longer needed.
                 if let Some(p) = old_png {
                     let _ = std::fs::remove_file(&p);
@@ -2019,8 +2163,6 @@ impl App {
                 if let Some(p) = old_xml {
                     let _ = std::fs::remove_file(&p);
                 }
-                self.load_screenshot(&png, ctx);
-                self.load_xml(&xml, ctx);
                 // Refresh the keep-monitor change-detection baseline from this
                 // fresh dump (also covers settle recaptures made during
                 // monitoring), so the next probe compares against what is on
@@ -2104,7 +2246,7 @@ impl eframe::App for App {
         }
 
         if let Some(tap_start) = self.tap_settle_start {
-            if tap_start.elapsed() >= std::time::Duration::from_millis(800) {
+            if tap_start.elapsed() >= SETTLE_DELAY {
                 self.tap_settle_start = None;
                 // Settle recaptures are user-driven feedback (tap/swipe result),
                 // not monitor ticks.
@@ -2124,17 +2266,20 @@ impl eframe::App for App {
         // from each completion, which also provides backpressure when a
         // capture takes longer than the interval.
         if self.keep_monitor {
-            // Liveness heartbeat: egui only repaints on input or explicit
-            // requests; the tick/probe/capture wake-up chains below have many
-            // branches, so guarantee a periodic frame regardless.
-            ctx.request_repaint_after(std::time::Duration::from_millis(MONITOR_HEARTBEAT_MS));
             // A background hierarchy probe is in flight (U2 two-tier mode):
-            // consume its result without blocking the UI thread.
+            // consume its result without blocking the UI thread. The probe
+            // thread requests a repaint on completion (event-driven), so no
+            // poll or heartbeat is needed here.
             if let Some(rx) = self.monitor_probe_rx.take() {
                 match rx.try_recv() {
                     Err(mpsc::TryRecvError::Empty) => {
+                        // Probe still running: restore the receiver and wait —
+                        // the thread's completion repaint wakes the UI to pick
+                        // up the result. As a safety net, also arm a wake-up at
+                        // the probe's own timeout, so a dead/spawn-failed probe
+                        // thread can't freeze the monitor with zero repaints.
                         self.monitor_probe_rx = Some(rx);
-                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                        ctx.request_repaint_after(PROBE_READ_TIMEOUT);
                     }
                     result => {
                         // Probe thread died → None → fall back to a full capture.
@@ -2199,8 +2344,13 @@ impl eframe::App for App {
                             // capture (JVM spawn), so it always captures fully.
                             let (tx, rx) = mpsc::channel();
                             self.monitor_probe_rx = Some(rx);
+                            let thread_ctx = ctx.clone();
                             std::thread::spawn(move || {
+                                // Mirror the capture thread: wake the UI when
+                                // the result is ready, so probing is
+                                // event-driven instead of polled.
                                 let _ = tx.send(probe_u2_hierarchy_hash());
+                                thread_ctx.request_repaint();
                             });
                         } else {
                             self.next_auto_capture = None;
@@ -2240,6 +2390,7 @@ impl eframe::App for App {
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
+                // ── File ──
                 let load_screenshot = || {
                     let mut dialog = rfd::FileDialog::new()
                         .add_filter("Images", &["png", "jpg", "jpeg"]);
@@ -2251,7 +2402,11 @@ impl eframe::App for App {
                 };
                 if ui.button("📷 Load Screenshot").clicked() {
                     if let Some(path) = load_screenshot() {
-                        self.load_screenshot(&path, &ctx);
+                        if !self.load_screenshot(&path, &ctx) {
+                            self.status_message =
+                                Some("Failed to load screenshot (or its paired XML)".into());
+                            self.status_is_error = true;
+                        }
                     }
                 }
                 let load_xml = || {
@@ -2265,7 +2420,11 @@ impl eframe::App for App {
                 };
                 if ui.button("📄 Load XML").clicked() {
                     if let Some(path) = load_xml() {
-                        self.load_xml(&path, &ctx);
+                        if !self.load_xml(&path, &ctx) {
+                            self.status_message =
+                                Some("Failed to load XML (or its paired screenshot)".into());
+                            self.status_is_error = true;
+                        }
                     }
                 }
                 if ui.add_enabled(!self.manual_refreshing, egui::Button::new("🔄 Refresh device")).clicked() {
@@ -2277,53 +2436,58 @@ impl eframe::App for App {
                     self.refresh_start = None;
                     self.refresh_devices(&ctx, true);
                 }
-                if !self.adb_devices.is_empty() {
-                    let current = self.selected_device.clone().unwrap_or_default();
-                    let previous = self.selected_device.clone();
-                    ui.add_enabled_ui(!self.capturing, |ui| {
-                        egui::ComboBox::from_id_salt("device_selector")
-                            .selected_text(current.as_str())
-                            .width(160.0)
-                            .show_ui(ui, |ui| {
-                                for serial in &self.adb_devices {
-                                    ui.selectable_value(
-                                        &mut self.selected_device,
-                                        Some(serial.clone()),
-                                        serial,
-                                    );
-                                }
-                            });
-                    });
-                    // Manual device switch: free the previous device's u2.jar
-                    // session (server + host forward) so the new device can
-                    // bind tcp:9008 cleanly. The selector is disabled while a
-                    // capture is in flight, so this never kills an active one.
-                    if self.selected_device != previous {
-                        if let Some(old) = previous {
-                            release_u2v3_resources(&old);
-                        }
+                // ── Device ──
+                // Always drawn; when no device is connected the selectors are
+                // empty/disabled rather than hidden.
+                ui.separator();
+                let has_device = !self.adb_devices.is_empty();
+                ui.label("Device:");
+                let current = self.selected_device.clone().unwrap_or_default();
+                let previous = self.selected_device.clone();
+                ui.add_enabled_ui(has_device && !self.capturing, |ui| {
+                    egui::ComboBox::from_id_salt("device_selector")
+                        .selected_text(current.as_str())
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            for serial in &self.adb_devices {
+                                ui.selectable_value(
+                                    &mut self.selected_device,
+                                    Some(serial.clone()),
+                                    serial,
+                                );
+                            }
+                        });
+                });
+                // Manual device switch: free the previous device's u2.jar
+                // session (server + host forward) so the new device can
+                // bind tcp:9008 cleanly. The selector is disabled while a
+                // capture is in flight, so this never kills an active one.
+                if self.selected_device != previous {
+                    if let Some(old) = previous {
+                        release_u2v3_resources(&old);
                     }
                 }
-                if !self.adb_devices.is_empty() {
-                    let current_disp = format!("Disp {}", self.display_id);
-                    let prev_disp = self.display_id;
-                    ui.add_enabled_ui(!self.capturing, |ui| {
-                        egui::ComboBox::from_id_salt("display_selector")
-                            .selected_text(&current_disp)
-                            .width(70.0)
-                            .show_ui(ui, |ui| {
-                                for &(log, _phys) in &self.available_displays {
-                                    let label = format!("Disp {log}");
-                                    ui.selectable_value(&mut self.display_id, log, label);
-                                }
-                            });
-                    });
-                    // Re-selecting the top display always moves the tree along.
-                    if self.display_id != prev_disp {
-                        self.tree_display_id = self.display_id;
-                    }
+                ui.label("Capture:");
+                let current_disp = format!("Disp {}", self.display_id);
+                let prev_disp = self.display_id;
+                ui.add_enabled_ui(has_device && !self.capturing, |ui| {
+                    egui::ComboBox::from_id_salt("display_selector")
+                        .selected_text(&current_disp)
+                        .width(70.0)
+                        .show_ui(ui, |ui| {
+                            for &(log, _phys) in &self.available_displays {
+                                let label = format!("Disp {log}");
+                                ui.selectable_value(&mut self.display_id, log, label);
+                            }
+                        });
+                });
+                // Re-selecting the top display always moves the tree along.
+                if self.display_id != prev_disp {
+                    self.tree_display_id = self.display_id;
                 }
                 ui.separator();
+
+                // ── Capture ──
                 // Keep-monitor switch: auto-capture with the last used method
                 // at a fixed interval. Toggling on fires immediately; the two
                 // capture buttons are disabled while it runs.
@@ -2367,27 +2531,12 @@ impl eframe::App for App {
                     self.last_capture = Some(CaptureMethod::U2V3);
                     self.start_capture(&ctx, CaptureMethod::U2V3);
                 }
+                ui.separator();
+
+                // ── Export ──
                 if ui.add_enabled(!self.capturing, egui::Button::new("💾 Save")).clicked() {
                     self.save_files();
                 }
-                ui.separator();
-                if let Some(path) = &self.screenshot_path {
-                    ui.label(format!(
-                        "Screenshot: {}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                }
-                if let Some(path) = &self.xml_path {
-                    ui.label(format!(
-                        "XML: {}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Clear").clicked() {
-                        self.selected_path = None;
-                    }
-                });
             });
         });
 
@@ -2400,6 +2549,18 @@ impl eframe::App for App {
                         Color32::from_rgb(0, 180, 0)
                     };
                     ui.colored_label(color, msg);
+                }
+                // Loaded file names, moved here from the toolbar to free space;
+                // the full path is shown on hover.
+                if let Some(path) = &self.screenshot_path {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    ui.label(format!("Screenshot: {name}"))
+                        .on_hover_text(path.display().to_string());
+                }
+                if let Some(path) = &self.xml_path {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    ui.label(format!("XML: {name}"))
+                        .on_hover_text(path.display().to_string());
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(p) = self.click_pos {
@@ -2417,6 +2578,7 @@ impl eframe::App for App {
             self.properties_width = ui.max_rect().width();
             ui.heading("Node Tree");
             if !self.file_displays.is_empty() || self.root_node.is_some() {
+                ui.label("Tree:");
                 let current_disp = format!("Display {}", self.tree_display_id);
                 let ids: Vec<u32> = if !self.file_displays.is_empty() {
                     self.file_displays.clone()

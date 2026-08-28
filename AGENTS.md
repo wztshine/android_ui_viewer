@@ -53,12 +53,12 @@ uiautomator2 capture (u2.jar JSON-RPC), manual file loading, and save-as.
 | `adb_capture(serial, display_id, display_physical, png, xml)` | ADB capture: screenshot and hierarchy run **concurrently** on two adb connections (`std::thread::scope`). Screenshot via `screencap -p [-d <phys>]` (`-d` only for secondary, logical id > 0); hierarchy via a single `exec-out` round trip — `--windows` first with plain-dump fallback, then `cat` + `rm -f`, output trimmed to the `<?xml` prologue (`find_subslice`) since uiautomator exit codes are unreliable |
 | `uiautomator2_v3_capture(serial, display_id, display_physical, png, xml)` | U2 capture: `ensure_u2v3_running` (warm server reuse), then fetches screenshot (`fetch_u2_screenshot`) and hierarchy (`fetch_u2_hierarchy`) concurrently |
 | `ensure_u2v3_running(serial)` | Warm path: forward-ownership check (`u2v3_forward_matches`) + `/ping` probe (`u2v3_alive`); falls back to `launch_u2v3` cold start when either fails |
-| `launch_u2v3(serial)` | Cold start: jar probe + fresh `tcp:9008` forward (stale forwards first swept across `U2V3_MANAGED_SERIALS`, i.e. only sessions this app created) + spawn u2.jar `app_process`, poll `/ping` every `U2V3_PING_POLL_INTERVAL` (100ms) up to a 30s deadline; failure cleanup is ownership-guarded (`stop_u2v3_if_current`) so a zombie thread can't kill a newer capture's server |
+| `launch_u2v3(serial)` | Cold start: jar probe + fresh `tcp:9008` forward (stale forwards first swept across `U2V3_MANAGED_SERIALS`, i.e. only sessions this app created) + spawn u2.jar `app_process`, poll `/ping` every `U2V3_PING_POLL_INTERVAL` (100ms) up to a `CAPTURE_TIMEOUT` (10s) deadline (the boot wait shares the capture budget so a cold start can't push a capture past the UI-side timeout); failure cleanup is ownership-guarded (`stop_u2v3_if_current`) so a zombie thread can't kill a newer capture's server |
 | `release_u2v3_resources(serial)` | Kill a device's u2.jar server (`stop_u2v3`) + drop its `tcp:9008` forward **only if this app created that session** (`U2V3_MANAGED_SERIALS`); called on manual device switch and on auto-switch when the active device disappears |
 | `stop_u2v3()` | Kill the streaming adb shell to terminate the remote app_process |
 | `stop_u2v3_if_current(id)` | Ownership-guarded stop: only kills the stored child if its id matches (zombie-thread safety) |
-| `http_request(addr, method, path, body, read_timeout)` | Raw HTTP/1.1 over TCP with per-call read timeout (`HTTP_READ_TIMEOUT` 30s for JSON-RPC, `U2V3_PING_TIMEOUT` 2s for `/ping` probes so a hung probe can't exceed the launch deadline); used by u2.jar JSON-RPC + `/ping` |
-| `http_jsonrpc(method, params)` | JSON-RPC POST to u2 v3 server (`/jsonrpc/0`) |
+| `http_request(addr, method, path, body, read_timeout)` | Raw HTTP/1.1 over TCP with per-call read timeout (`HTTP_READ_TIMEOUT` 10s for JSON-RPC, bound to `CAPTURE_TIMEOUT` so a zombie thread's request can't outlive the abandoned capture; `PROBE_READ_TIMEOUT` 2s for keep-monitor hierarchy probes so a stalled probe counts as failed quickly; `U2V3_PING_TIMEOUT` 2s for `/ping` probes so a hung probe can't exceed the launch deadline); used by u2.jar JSON-RPC + `/ping` |
+| `http_jsonrpc(method, params)` | JSON-RPC POST to u2 v3 server (`/jsonrpc/0`) with `HTTP_READ_TIMEOUT`; `http_jsonrpc_with_timeout` is the same call with an explicit read timeout (used by the keep-monitor probe with `PROBE_READ_TIMEOUT`) |
 | `render_tree(ui, node, ...)` | Recursively render collapsible tree with arrows, indentation, colored labels |
 | `build_label(attrs)` | Format node label `ClassName "text" [resource-id]`; precomputed once at parse time into `UiNode.label` (zero per-frame allocation) |
 | `start_capture(method)` / `poll_capture` | Background-thread capture: records `U2V3_SERIAL` on the main thread, spawns thread + mpsc channel, polls `(CaptureMethod, CaptureResult)` each frame |
@@ -109,8 +109,8 @@ below — without the gate, a click there would phantom-select a hidden node.
 ### Image Interaction
 
 - **Click**: `response.clicked()` → `selected_path` + `scroll_to_target` → green highlight + tree scroll + ancestor auto-expand. Same-spot click cycles up through ancestors.
-- **Double-click**: `response.double_clicked()` → `pending_tap` → 800ms settle → re-capture. Sends `input tap [--display <id>]` to device.
-- **Drag**: `Sense::click_and_drag()` → `drag_start_img` → on release with distance ≥ 10px, sends `input swipe [--display <id>] <x1> <y1> <x2> <y2>` → 800ms settle → re-capture.
+- **Double-click**: `response.double_clicked()` → `pending_tap` → `SETTLE_DELAY` (1s) settle → re-capture. Sends `input tap [--display <id>]` to device.
+- **Drag**: `Sense::click_and_drag()` → `drag_start_img` → on release with distance ≥ 10px, sends `input swipe [--display <id>] <x1> <y1> <x2> <y2>` → `SETTLE_DELAY` (1s) settle → re-capture.
 - **Hover**: `response.hover_pos()` → `find_branch()` → `hovered_path` → red highlight + property preview. Skipped if mouse hasn't moved ≥ 5px (`last_hover_img_pos`).
 
 ### Multi-Display Support
@@ -121,7 +121,7 @@ below — without the gate, a click there would phantom-select a hidden node.
 - **U2**: screenshot via JSON-RPC `takeScreenshot` (primary) or ADB `screencap` (secondary); hierarchy via `dumpWindowHierarchy` (primary display only) — neither engine isolates a secondary display's layout, so the layout is each method's best effort. Success status appends "(screenshot via ADB)" (`ShotSource`) whenever the screenshot actually came from `screencap` (secondary display or RPC fallback)
 - **File parsing**: `parse_windows_xml` handles `<hierarchy><displays><display>`, hybrid `<hierarchy><display>`, and `--windows` `<displays><display><window><hierarchy>` formats
 - **On display change**: for file-loaded data, re-parses XML from `file_xml_content` with `tree_display_id` (cached by `parsed_tree_display_id` to avoid per-frame re-parse); for device capture, re-captures with `display_id`
-- **After capture**: `tree_display_id` set to captured `display_id` while `parsed_tree_display_id` is left stale, so the ui() re-parse guard re-parses the multi-display XML for the captured display (prevents showing `file_displays[0]`'s tree under the wrong label)
+- **After capture**: `load_captured_pair` parses the dump for the current `tree_display_id` (falling back to `file_displays[0]` when it's not in the dump) and sets `tree_display_id` == `parsed_tree_display_id` to that value, so the ui() re-parse guard does not fire — the tree is already built for the correct display (prevents showing `file_displays[0]`'s tree under the wrong label)
 
 ### Properties Panel
 
@@ -150,7 +150,7 @@ buttons are disabled while `capturing`.
 
 #### Background execution
 - `start_capture`: records `U2V3_SERIAL` on the main thread (so exit cleanup works even if the app closes while the thread starts), generates unique temp paths, stores them in `in_flight_screenshot`/`in_flight_xml`, spawns thread, sends `(CaptureMethod, CaptureResult)` via mpsc, requests repaint on completion
-- `poll_capture`: polls the channel; Empty → `ctx.request_repaint_after` schedules a wake-up at the `CAPTURE_TIMEOUT` (30s) deadline (fires even without user input); Ok → load + track temps; Err/timeout/Disconnected → restore previous temps and clear `in_flight_*`
+- `poll_capture`: polls the channel; Empty → `ctx.request_repaint_after` schedules a wake-up at the `CAPTURE_TIMEOUT` (10s) deadline (fires even without user input); Ok → load + track temps; Err/timeout/Disconnected → restore previous temps and clear `in_flight_*`
 - Timeout: drops the receiver so the zombie thread's eventual send fails and its SendError arm self-cleans its own files; also calls `stop_u2v3()` so a zombie U2V3 thread's HTTP calls fail fast instead of hitting a newer capture's server. Disconnected also calls `stop_u2v3()` to kill any server orphaned by a panicked thread
 
 #### ADB Capture
@@ -159,11 +159,11 @@ buttons are disabled while `capturing`.
 
 #### U2 Capture (u2.jar)
 - Requires `u2.jar` on device (`python -m uiautomator2 init`); the toolbar's u2 button uses this method
-- Server kept alive across captures: each capture first runs `ensure_u2v3_running` — forward ownership for the current serial (`u2v3_forward_matches`, guards against multi-device stale forwards routing 127.0.0.1:9008 to the wrong phone) + `/ping` probe (`u2v3_alive`). Only when either fails does `launch_u2v3` cold-start: jar probe → fresh forward → new `app_process` → `/ping` polled every 100ms with a 30s deadline. Warm captures skip jar probe, forward setup and server spawn entirely
+- Server kept alive across captures: each capture first runs `ensure_u2v3_running` — forward ownership for the current serial (`u2v3_forward_matches`, guards against multi-device stale forwards routing 127.0.0.1:9008 to the wrong phone) + `/ping` probe (`u2v3_alive`). Only when either fails does `launch_u2v3` cold-start: jar probe → fresh forward → new `app_process` → `/ping` polled every 100ms with a `CAPTURE_TIMEOUT` (10s) deadline. Warm captures skip jar probe, forward setup and server spawn entirely
 - Ownership attribution: serials whose forward+server this app created are tracked in `U2V3_MANAGED_SERIALS`; all cleanup paths (device-switch release, cold-start sweep, exit cleanup) only touch those. A server started by another tool (e.g. python-uiautomator2, which shares the tcp:9008 convention) is transparently reused via the warm path and left alive on switch/exit; taking over the *target* device itself (unconditional pkill + same-spec forward remove before launch) remains intentional
 - Screenshot (`takeScreenshot` / screencap fallback) and hierarchy (`dumpWindowHierarchy`) are fetched concurrently; if the server serializes requests internally this merely degrades to sequential timing
 - Primary display screenshot via JSON-RPC `takeScreenshot` → base64 JPEG (MIME-style, newline every 76 chars — whitespace stripped before decoding); any takeScreenshot failure (RPC error / non-string / empty / undecodable) falls back to ADB screencap; secondary displays use ADB `screencap -d <phys>` for the image (layout stays primary-only `dumpWindowHierarchy`)
-- Hierarchy via `dumpWindowHierarchy`, retried up to 3× when the server returns empty
+- Hierarchy via `dumpWindowHierarchy`, retried up to 2× when the server returns empty
 
 #### Exit Cleanup
 - `main()`: reads `U2V3_SERIAL` mutex — `stop_u2v3()` + `pkill -f u2.jar` + remove `tcp:9008` forward, only if u2.jar was used this session; the serial is recorded in `start_capture` on the main thread
@@ -182,6 +182,7 @@ Toolbar checkbox + interval stepper (`-`/`+` buttons, 0.5s steps, clamped 0.5–
 
 - **Method/source**: uses `last_capture` (the previously used method); `start_capture` reads the currently selected device + display id at fire time. Ticks yield while `pending_tap`/`tap_settle_start` is active so user tap/swipe feedback recaptures are never displaced.
 - **Scheduling**: next tick is scheduled from each capture *completion* (`poll_capture` Ok arm) — natural backpressure when a capture outlasts the interval.
+- **Wake-ups (event-driven)**: the capture thread and the U2 probe thread both call `ctx.request_repaint()` once their result is ready; an idle wait between ticks arms a single precise `request_repaint_after(next_auto_capture - now)` wake-up instead. No heartbeat or polling keeps the UI awake, so monitoring costs zero repaints while idle — even a probe whose result is "unchanged" triggers exactly one repaint to be handled.
 - **Two-tier change detection (U2 method only)**: each tick first runs an off-thread hierarchy-only RPC probe (`probe_u2_hierarchy_hash`, result hashed with FNV-1a). Full capture fires only when the hash changed, every `MONITOR_FORCE_REFRESH_EVERY` unchanged probes (eventual consistency for pixel-only changes like video), or when the probe fails (then the real capture surfaces the error or recovers). ADB method always captures fully (its probe would cost the same JVM spawn).
 - **Tree panel**: monitor-driven captures never retarget `tree_display_id` (`capture_source_auto` flag distinguishes them from user-driven ones); successful captures made while monitoring refresh the baseline hash from the fresh dump.
 
