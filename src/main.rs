@@ -717,22 +717,41 @@ fn count_matches(root: &UiNode, preds: &[(&str, &str)]) -> u32 {
     count
 }
 
+// Render an XPath 1.0 string literal for `v`, reproducing the raw value
+// verbatim — special whitespace (newlines, tabs) is kept so a text predicate
+// matches the dump exactly. XPath 1.0 literals have no escape sequence, so the
+// delimiter is picked around the value's own quotes: `'...'` unless the value
+// contains a single quote, then `"..."` unless it also contains a double
+// quote, then `concat()` reassembles the value across the quotes.
+fn xpath_literal(v: &str) -> String {
+    if !v.contains('\'') {
+        return format!("'{v}'");
+    }
+    if !v.contains('"') {
+        return format!("\"{v}\"");
+    }
+    // Both quote types present: split on single quotes and stitch the parts
+    // back together with `concat(segment, "'", segment, ...)`.
+    let mut args: Vec<String> = Vec::new();
+    for (i, part) in v.split('\'').enumerate() {
+        if i > 0 {
+            args.push("\"'\"".to_string());
+        }
+        if !part.is_empty() {
+            args.push(format!("'{part}'"));
+        }
+    }
+    format!("concat({})", args.join(", "))
+}
+
 // Render a uiautomator-style XPath from ordered (attr, value) predicates.
 fn build_xpath_str(preds: &[(&str, &str)]) -> String {
     let mut s = String::from("//*");
     for (k, v) in preds {
         use std::fmt::Write;
-        write!(s, "[@{k}='{v}']").ok();
+        write!(s, "[@{k}={}]", xpath_literal(v)).ok();
     }
     s
-}
-
-// XPath 1.0 string literals have no escape sequence: a single quote inside a
-// `'...'` literal is the one character that breaks the syntax, and control
-// characters (newlines, tabs) make the expression hard to read or embed.
-// Rejecting such values guarantees every generated XPath is well-formed.
-fn xpath_literal_safe(v: &str) -> bool {
-    !v.contains('\'') && !v.chars().any(char::is_control)
 }
 
 // Generate a unique page-level XPath for `node` within `root`. text and
@@ -742,16 +761,15 @@ fn xpath_literal_safe(v: &str) -> bool {
 // `[@selected='true']` / `[@checked='false']` style. Returns None when no
 // candidate matches exactly one node — callers leave the value empty.
 fn generate_xpath(node: &UiNode, root: &UiNode) -> Option<String> {
-    // Values that would break the XPath literal syntax are skipped entirely.
-    let t = node_attr(node, "text").filter(|v| xpath_literal_safe(v));
-    let r = node_attr(node, "resource-id").filter(|v| xpath_literal_safe(v));
-    let d = node_attr(node, "content-desc").filter(|v| xpath_literal_safe(v));
-    let c = node_attr(node, "class").filter(|v| xpath_literal_safe(v));
+    let t = node_attr(node, "text");
+    let r = node_attr(node, "resource-id");
+    let d = node_attr(node, "content-desc");
+    let c = node_attr(node, "class");
 
     // State predicates used as a last-resort disambiguator.
     let mut state: Vec<(&str, &str)> = Vec::new();
     for k in ["checked", "selected"] {
-        if let Some(v) = node_attr(node, k).filter(|v| xpath_literal_safe(v)) {
+        if let Some(v) = node_attr(node, k) {
             state.push((k, v));
         }
     }
@@ -2698,16 +2716,6 @@ impl eframe::App for App {
             };
 
             if let Some(node) = node {
-                ui.colored_label(
-                    egui::Color32::BLACK,
-                    format!(
-                        "Bounds: [{:.0},{:.0}][{:.0},{:.0}]",
-                        node.bounds.min.x,
-                        node.bounds.min.y,
-                        node.bounds.max.x,
-                        node.bounds.max.y,
-                    ),
-                );
                 ui.label(egui::RichText::new("XPath:").strong());
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.add(
@@ -2723,9 +2731,6 @@ impl eframe::App for App {
                     .id_salt("props_scroll")
                     .show(ui, |ui| {
                         for (key, value) in &node.attrs {
-                            if key == "bounds" {
-                                continue;
-                            }
                             ui.label(
                                 egui::RichText::new(format!("{key}:"))
                                     .strong(),
@@ -3064,15 +3069,24 @@ mod tests {
     }
 
     #[test]
-    fn quote_in_value_is_skipped() {
-        let n = node(&[("class", "android.widget.TextView"), ("text", "it's")]);
-        assert_eq!(generate_xpath(&n, &n), None);
+    fn newline_in_text_is_faithfully_included() {
+        let n = node(&[("class", "android.widget.TextView"), ("text", "line1\nline2")]);
+        let xp = generate_xpath(&n, &n).unwrap();
+        assert_eq!(xp, "//*[@text='line1\nline2']");
     }
 
     #[test]
-    fn xpath_literal_safe_rejects_quotes_and_controls() {
-        assert!(!xpath_literal_safe("it's"));
-        assert!(!xpath_literal_safe("a\nb"));
-        assert!(xpath_literal_safe("a<b&c\"d"));
+    fn quote_in_text_uses_double_quote_delimiter() {
+        let n = node(&[("class", "android.widget.TextView"), ("text", "it's")]);
+        assert_eq!(generate_xpath(&n, &n).unwrap(), "//*[@text=\"it's\"]");
+    }
+
+    #[test]
+    fn mixed_quotes_use_concat() {
+        let n = node(&[("class", "android.widget.TextView"), ("text", "a'b\"c")]);
+        assert_eq!(
+            generate_xpath(&n, &n).unwrap(),
+            "//*[@text=concat('a', \"'\", 'b\"c')]"
+        );
     }
 }
