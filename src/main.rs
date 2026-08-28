@@ -120,6 +120,11 @@ const U2V3_PRIMARY_DISPLAY_ID: i32 = 0;
 const U2V3_SCREENSHOT_QUALITY: i32 = 80;
 const U2V3_DUMP_COMPRESSED: bool = false;
 const U2V3_DUMP_MAX_DEPTH: i32 = 50;
+// Cap the XPath box height in the Properties panel so an extremely long
+// expression (e.g. a text/content-desc with many newlines) can't squeeze the
+// attribute list below it out of view; longer XPaths scroll inside their own
+// box instead.
+const XPATH_MAX_HEIGHT: f32 = 90.0;
 
 struct TempGuard {
     files: Vec<PathBuf>,
@@ -245,6 +250,26 @@ fn build_label(attrs: &[(String, String)]) -> String {
         let b = s.floor_char_boundary(97);
         s.truncate(b);
         s.push('…');
+    }
+    s
+}
+
+// Render the XPath as a single-line string ready to embed in a double-quoted
+// string literal: backslash and double quote are escaped, and the control
+// whitespace (LF/CR/tab) becomes `\n`/`\r`/`\t`. The host decodes those
+// escapes at runtime back to the real characters, so the string that reaches
+// the XPath engine is identical to the raw multi-line form.
+fn xpath_escaped_for_code(xpath: &str) -> String {
+    let mut s = String::with_capacity(xpath.len() + 8);
+    for c in xpath.chars() {
+        match c {
+            '\\' => s.push_str("\\\\"),
+            '"' => s.push_str("\\\""),
+            '\n' => s.push_str("\\n"),
+            '\r' => s.push_str("\\r"),
+            '\t' => s.push_str("\\t"),
+            _ => s.push(c),
+        }
     }
     s
 }
@@ -2716,15 +2741,37 @@ impl eframe::App for App {
             };
 
             if let Some(node) = node {
-                ui.label(egui::RichText::new("XPath:").strong());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("XPath:").strong());
+                    if let Some(xp) = xpath.as_ref() {
+                        if ui
+                            .small_button("Copy escaped")
+                            .on_hover_text(
+                                "Copy a single-line version with \\n/\\t escapes, ready to paste into a string literal",
+                            )
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(xpath_escaped_for_code(xp));
+                            self.status_message =
+                                Some("Copied escaped XPath".into());
+                            self.status_is_error = false;
+                        }
+                    }
+                });
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(xpath.as_deref().unwrap_or("")).monospace(),
-                        )
-                        .wrap()
-                        .selectable(true),
-                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("xpath_scroll")
+                        .max_height(XPATH_MAX_HEIGHT)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(xpath.as_deref().unwrap_or(""))
+                                        .monospace(),
+                                )
+                                .wrap()
+                                .selectable(true),
+                            );
+                        });
                 });
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -3066,6 +3113,40 @@ mod tests {
         let dup = node(&[("class", "android.widget.TextView"), ("text", "设置")]);
         let root = root_with(vec![dup.clone(), dup]);
         assert_eq!(generate_xpath(&root.children[0], &root), None);
+    }
+
+    #[test]
+    fn xpath_escaped_for_code_escapes_control_chars_and_quotes() {
+        assert_eq!(
+            xpath_escaped_for_code("//*[@text='a\nb\tc\rd']"),
+            "//*[@text='a\\nb\\tc\\rd']"
+        );
+        assert_eq!(
+            xpath_escaped_for_code("//*[@text=\"it's\"]"),
+            "//*[@text=\\\"it's\\\"]"
+        );
+        assert_eq!(
+            xpath_escaped_for_code("//*[@text='a\"b\\c']"),
+            "//*[@text='a\\\"b\\\\c']"
+        );
+    }
+
+    #[test]
+    fn attribute_values_follow_xml_normalization() {
+        // Attribute values must be normalized the same way libxml2/lxml does
+        // (the engine behind uiautomator2's d.xpath): literal whitespace
+        // (#x9/#xA/#xD) collapses to a space, while character references
+        // (&#10;, &#9;) are preserved verbatim. Only then does a generated
+        // XPath text predicate match what the consumer's parser sees.
+        let doc = Document::parse(
+            "<node text=\"line1\nline2\" a=\"x&#10;y\" b=\"a&#9;b\" c=\"x\n\ty\"/>",
+        )
+        .unwrap();
+        let root = doc.root_element();
+        assert_eq!(root.attribute("text"), Some("line1 line2"));
+        assert_eq!(root.attribute("a"), Some("x\ny"));
+        assert_eq!(root.attribute("b"), Some("a\tb"));
+        assert_eq!(root.attribute("c"), Some("x  y"));
     }
 
     #[test]
