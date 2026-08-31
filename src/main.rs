@@ -393,6 +393,15 @@ struct App {
     // (tree_revision, displayed path, computed XPath) cache: hovering repaints
     // share the same path, avoiding a full-tree XPath uniqueness walk per frame.
     xpath_cache: Option<(u64, Vec<usize>, Option<String>)>,
+    // Crop region for "Export Icon": top-left (x1, y1) and bottom-right
+    // (x2, y2) screenshot pixel coordinates. When both corners are entered the
+    // export crops this rectangle instead of the selected element's bounds; the
+    // fields are cleared once a coordinate-based export succeeds so stale
+    // values can't be reused by a later click.
+    crop_x1: String,
+    crop_y1: String,
+    crop_x2: String,
+    crop_y2: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -472,6 +481,10 @@ impl Default for App {
             manual_refreshing: false,
             tree_revision: 0,
             xpath_cache: None,
+            crop_x1: String::new(),
+            crop_y1: String::new(),
+            crop_x2: String::new(),
+            crop_y2: String::new(),
         }
     }
 }
@@ -1867,8 +1880,43 @@ impl App {
         }
     }
 
+    // True when any crop coordinate field holds text (even if not fully valid),
+    // so the Export Icon button stays available for coordinate-based cropping
+    // without a tree selection. Trimmed so whitespace-only input isn't treated
+    // as a coordinate (crop_coord_rect would parse it as None anyway).
+    fn has_crop_input(&self) -> bool {
+        !(self.crop_x1.trim().is_empty()
+            && self.crop_y1.trim().is_empty()
+            && self.crop_x2.trim().is_empty()
+            && self.crop_y2.trim().is_empty())
+    }
+
+    // Parse the crop TL/BR inputs into a pixel Rect. Returns Some only when
+    // every field parses as a number (corner order is normalized), None when
+    // any field is empty/invalid — callers then fall back to the selected
+    // element's bounds.
+    fn crop_coord_rect(&self) -> Option<Rect> {
+        let x1: f32 = self.crop_x1.trim().parse().ok()?;
+        let y1: f32 = self.crop_y1.trim().parse().ok()?;
+        let x2: f32 = self.crop_x2.trim().parse().ok()?;
+        let y2: f32 = self.crop_y2.trim().parse().ok()?;
+        Some(Rect::from_min_max(
+            pos2(x1.min(x2), y1.min(y2)),
+            pos2(x1.max(x2), y1.max(y2)),
+        ))
+    }
+
+    fn clear_crop_coords(&mut self) {
+        self.crop_x1.clear();
+        self.crop_y1.clear();
+        self.crop_x2.clear();
+        self.crop_y2.clear();
+    }
+
     // Export the selected element's bounds region from the screenshot as a
-    // small PNG icon. No-op when the user cancels the save dialog.
+    // small PNG icon. When TL/BR crop coordinates are entered (all four fields
+    // parse), that rectangle is cropped instead and the fields are cleared on
+    // success. No-op when the user cancels the save dialog.
     fn export_icon(&mut self) {
         let screenshot = match self.screenshot_path.clone() {
             Some(p) => p,
@@ -1878,26 +1926,39 @@ impl App {
                 return;
             }
         };
-        let node = self
-            .selected_path
-            .as_ref()
-            .and_then(|p| self.root_node.as_ref()?.node_at(p));
-        let node = match node {
-            Some(n) => n,
+        let coord_rect = self.crop_coord_rect();
+        let (bounds, default_name, via_coords) = match coord_rect {
+            Some(rect) => (rect, "icon.png".to_string(), true),
             None => {
-                self.status_message = Some("No element selected".into());
-                self.status_is_error = true;
-                return;
+                let node = self
+                    .selected_path
+                    .as_ref()
+                    .and_then(|p| self.root_node.as_ref()?.node_at(p));
+                let node = match node {
+                    Some(n) => n,
+                    None => {
+                        self.status_message =
+                            Some("No element selected — enter TL/BR coordinates or select an element".into());
+                        self.status_is_error = true;
+                        return;
+                    }
+                };
+                (node.bounds, export_icon_name(node), false)
             }
         };
-        let mut dialog = rfd::FileDialog::new().set_file_name(export_icon_name(node));
+        let mut dialog = rfd::FileDialog::new().set_file_name(default_name);
         if let Some(ref dir) = self.screenshot_dir {
             dialog = dialog.set_directory(dir);
         }
         let Some(save_path) = dialog.save_file() else { return };
         let out = save_path.with_extension("png");
-        match crop_screenshot(&screenshot, node.bounds, &out) {
+        match crop_screenshot(&screenshot, bounds, &out) {
             Ok(()) => {
+                // A coordinate-based export consumed its inputs: clear them so
+                // a later click can't silently reuse a stale region.
+                if via_coords {
+                    self.clear_crop_coords();
+                }
                 self.status_message = Some(format!(
                     "Icon saved as {}",
                     out.file_name().unwrap_or_default().to_string_lossy()
@@ -2705,14 +2766,43 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading("Properties");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.selected_path.is_some()
-                        && self.screenshot_path.is_some()
+                    if self.screenshot_path.is_some()
+                        && (self.selected_path.is_some() || self.has_crop_input())
                         && ui.button("✂️ Export Icon").clicked()
                     {
                         export_requested = true;
                     }
                 });
             });
+            // Crop TL/BR coordinate inputs. When all four are filled, "Export
+            // Icon" crops this pixel rectangle (taking priority over the
+            // selected element) and then clears the fields.
+            if self.screenshot_path.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("Crop TL:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.crop_x1)
+                            .desired_width(36.0)
+                            .hint_text("x"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.crop_y1)
+                            .desired_width(36.0)
+                            .hint_text("y"),
+                    );
+                    ui.label("BR:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.crop_x2)
+                            .desired_width(36.0)
+                            .hint_text("x"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.crop_y2)
+                            .desired_width(36.0)
+                            .hint_text("y"),
+                    );
+                });
+            }
             ui.separator();
 
             let target = self
@@ -3179,5 +3269,61 @@ mod tests {
             generate_xpath(&n, &n).unwrap(),
             "//*[@text=concat('a', \"'\", 'b\"c')]"
         );
+    }
+
+    #[test]
+    fn crop_coord_rect_parses_all_four_fields() {
+        let mut app = App::default();
+        app.crop_x1 = "10".into();
+        app.crop_y1 = "20".into();
+        app.crop_x2 = "100".into();
+        app.crop_y2 = "80".into();
+        assert_eq!(
+            app.crop_coord_rect(),
+            Some(Rect::from_min_max(pos2(10.0, 20.0), pos2(100.0, 80.0)))
+        );
+    }
+
+    #[test]
+    fn crop_coord_rect_normalizes_reversed_corners() {
+        let mut app = App::default();
+        app.crop_x1 = "100".into();
+        app.crop_y1 = "80".into();
+        app.crop_x2 = "10".into();
+        app.crop_y2 = "20".into();
+        assert_eq!(
+            app.crop_coord_rect(),
+            Some(Rect::from_min_max(pos2(10.0, 20.0), pos2(100.0, 80.0)))
+        );
+    }
+
+    #[test]
+    fn crop_coord_rect_none_when_partial_or_invalid() {
+        let mut app = App::default();
+        app.crop_x1 = "10".into();
+        app.crop_y1 = "20".into();
+        app.crop_x2 = "abc".into();
+        app.crop_y2 = "80".into();
+        assert_eq!(app.crop_coord_rect(), None);
+        assert!(app.has_crop_input());
+        app.clear_crop_coords();
+        assert_eq!(app.crop_coord_rect(), None);
+        assert!(!app.has_crop_input());
+    }
+
+    #[test]
+    fn has_crop_input_true_when_any_field_filled() {
+        let mut app = App::default();
+        assert!(!app.has_crop_input());
+        app.crop_x2 = "50".into();
+        assert!(app.has_crop_input());
+    }
+
+    #[test]
+    fn has_crop_input_ignores_whitespace_only() {
+        let mut app = App::default();
+        app.crop_x1 = "  ".into();
+        app.crop_y1 = "\t".into();
+        assert!(!app.has_crop_input());
     }
 }
