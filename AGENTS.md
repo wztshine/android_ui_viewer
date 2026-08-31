@@ -25,7 +25,8 @@ uiautomator2 capture (u2.jar JSON-RPC), manual file loading, and save-as.
 ├── src/main.rs      # app source
 ├── Cargo.toml
 ├── AGENTS.md
-└── README.md
+├── README.md        # bilingual (EN/ZH) overview
+└── README.zh.md     # Chinese-only overview
 ```
 
 ## Architecture
@@ -44,25 +45,24 @@ uiautomator2 capture (u2.jar JSON-RPC), manual file loading, and save-as.
 
 | Function | Role |
 |---|---|
-| `parse_xml(xml)` | Parse standard uiautomator dump into `UiNode` tree; handles multiple top-level `<node>` via `merge_nodes` |
-| `parse_windows_xml(text, display_id)` | Parse `--windows` format (`<displays>` / hybrid / direct `<display>` children), extract nodes for given display |
-| `get_display_ids_from_xml(text)` | Detect multi-display format and return list of display IDs from XML |
+| `parse_xml(xml)` | Parse standard uiautomator dump into `UiNode` tree; wraps multiple top-level `<node>` via `merge_nodes` |
+| `parse_windows_xml(text, display_id)` | Parse `--windows` formats (`<displays>` / hybrid / direct children), extract nodes for given display |
+| `get_display_ids_from_xml(text)` | Detect multi-display format and list display IDs from XML |
 | `merge_nodes(nodes)` | Wrap multiple root nodes in a synthetic `FrameLayout` root |
-| `load_texture(path, ctx)` | Load image into egui texture; format detected from file **content** (`with_guessed_format`), not extension — handles JPEG-in-`.png` (U2 v3) and mismatched user files |
-| `get_displays(serial)` | Query device for `Vec<(logical_id, physical_id)>` via `dumpsys display` + `dumpsys SurfaceFlinger --display-id` |
-| `adb_capture(serial, display_id, display_physical, png, xml)` | ADB capture: screenshot and hierarchy run **concurrently** on two adb connections (`std::thread::scope`). Screenshot via `screencap -p [-d <phys>]` (`-d` only for secondary, logical id > 0); hierarchy via a single `exec-out` round trip — `--windows` first with plain-dump fallback, then `cat` + `rm -f`, output trimmed to the `<?xml` prologue (`find_subslice`) since uiautomator exit codes are unreliable |
-| `uiautomator2_v3_capture(serial, display_id, display_physical, png, xml)` | U2 capture: `ensure_u2v3_running` (warm server reuse), then fetches screenshot (`fetch_u2_screenshot`) and hierarchy (`fetch_u2_hierarchy`) concurrently |
-| `ensure_u2v3_running(serial)` | Warm path: forward-ownership check (`u2v3_forward_matches`) + `/ping` probe (`u2v3_alive`); falls back to `launch_u2v3` cold start when either fails |
-| `launch_u2v3(serial)` | Cold start: jar probe + fresh `tcp:9008` forward (stale forwards first swept across `U2V3_MANAGED_SERIALS`, i.e. only sessions this app created) + spawn u2.jar `app_process`, poll `/ping` every `U2V3_PING_POLL_INTERVAL` (100ms) up to a `CAPTURE_TIMEOUT` (10s) deadline (the boot wait shares the capture budget so a cold start can't push a capture past the UI-side timeout); failure cleanup is ownership-guarded (`stop_u2v3_if_current`) so a zombie thread can't kill a newer capture's server |
-| `release_u2v3_resources(serial)` | Kill a device's u2.jar server (`stop_u2v3`) + drop its `tcp:9008` forward **only if this app created that session** (`U2V3_MANAGED_SERIALS`); called on manual device switch and on auto-switch when the active device disappears |
-| `stop_u2v3()` | Kill the streaming adb shell to terminate the remote app_process |
-| `stop_u2v3_if_current(id)` | Ownership-guarded stop: only kills the stored child if its id matches (zombie-thread safety) |
-| `http_request(addr, method, path, body, read_timeout)` | Raw HTTP/1.1 over TCP with per-call read timeout (`HTTP_READ_TIMEOUT` 10s for JSON-RPC, bound to `CAPTURE_TIMEOUT` so a zombie thread's request can't outlive the abandoned capture; `PROBE_READ_TIMEOUT` 2s for keep-monitor hierarchy probes so a stalled probe counts as failed quickly; `U2V3_PING_TIMEOUT` 2s for `/ping` probes so a hung probe can't exceed the launch deadline); used by u2.jar JSON-RPC + `/ping` |
-| `http_jsonrpc(method, params)` | JSON-RPC POST to u2 v3 server (`/jsonrpc/0`) with `HTTP_READ_TIMEOUT`; `http_jsonrpc_with_timeout` is the same call with an explicit read timeout (used by the keep-monitor probe with `PROBE_READ_TIMEOUT`) |
+| `load_texture(path, ctx)` | Load image into egui texture; format from file **content**, not extension — handles JPEG-in-`.png` (U2 v3) |
+| `get_displays(serial)` | Pair logical IDs (`dumpsys display`) with physical IDs (`dumpsys SurfaceFlinger --display-id`) |
+| `adb_capture(...)` | ADB capture (see "ADB Capture"): concurrent screencap + single exec-out hierarchy dump trimmed to the `<?xml` prologue |
+| `uiautomator2_v3_capture(...)` | U2 capture (see "U2 Capture"): `ensure_u2v3_running` warm path, then concurrent screenshot + hierarchy fetch |
+| `ensure_u2v3_running(serial)` | Warm server reuse check (`u2v3_forward_matches` + `/ping`); falls back to `launch_u2v3` cold start |
+| `launch_u2v3(serial)` | Cold start: jar probe + fresh `tcp:9008` forward + `app_process`, `/ping` polled until `CAPTURE_TIMEOUT` deadline |
+| `release_u2v3_resources(serial)` | Stop u2.jar server + drop forward **only for sessions this app created** (`U2V3_MANAGED_SERIALS`); on device switch / disappearance |
+| `stop_u2v3()` / `stop_u2v3_if_current(id)` | Kill the streaming adb shell / ownership-guarded stop (zombie-thread safety) |
+| `http_request(addr, method, path, body, read_timeout)` | Raw HTTP/1.1 with per-call read timeout (`HTTP_READ_TIMEOUT` = `CAPTURE_TIMEOUT` for JSON-RPC; `PROBE_READ_TIMEOUT` 2s for probes; `U2V3_PING_TIMEOUT` 2s for `/ping`) |
+| `http_jsonrpc(method, params)` | JSON-RPC POST to `/jsonrpc/0`; `http_jsonrpc_with_timeout` adds an explicit read timeout (keep-monitor probe) |
 | `render_tree(ui, node, ...)` | Recursively render collapsible tree with arrows, indentation, colored labels |
-| `build_label(attrs)` | Format node label `ClassName "text" [resource-id]`; precomputed once at parse time into `UiNode.label` (zero per-frame allocation) |
-| `start_capture(method)` / `poll_capture` | Background-thread capture: records `U2V3_SERIAL` on the main thread, spawns thread + mpsc channel, polls `(CaptureMethod, CaptureResult)` each frame |
-| `refresh_devices` / `poll_device_refresh` | Background-thread device/display refresh (15s rate-limited, 15s `REFRESH_TIMEOUT` safety net), mpsc result applied off-thread; adb calls bounded via `adb_output_bounded` so a hung adb can't leak a zombie thread |
+| `build_label(attrs)` | Precompute node label `ClassName "text" [resource-id]` once at parse time |
+| `start_capture(method)` / `poll_capture` | Background-thread capture: record `U2V3_SERIAL`, spawn thread + mpsc, poll result each frame (see "Capture Lifecycle") |
+| `refresh_devices` / `poll_device_refresh` | Background-thread device/display refresh (see "Device Refresh"): 15s rate-limit, `adb_output_bounded`, `REFRESH_TIMEOUT` safety net |
 | `next_temp_id()` | `AtomicU64` counter for unique temp file names (`TEMP_COUNTER`) |
 
 ### Layout Structure
@@ -127,6 +127,8 @@ below — without the gate, a click there would phantom-select a hidden node.
 
 - `Panel::right("properties_panel")` (resizable, min 80px) — replaces old manual divider drag inside CentralPanel
 - Labels on separate lines (key bold, value selectable+wrap)
+- **XPath box**: `generate_xpath` builds an `//*[@attr="value"]` expression for the hovered/selected node, shown above the attribute list; cached by `(tree_revision, path)` in `xpath_cache` so hover repaints don't re-walk the tree every frame; capped at `XPATH_MAX_HEIGHT` (90px) with its own scroll so long text/content-desc can't squeeze the attributes out of view
+- **Export Icon**: `✂️ Export Icon` button crops the selected node's `bounds` from the screenshot (`crop_screenshot`) and saves as PNG, default filename from `export_icon_name` (resource-id/text/class)
 
 ### find_branch Behavior
 
@@ -136,8 +138,7 @@ below — without the gate, a click there would phantom-select a hidden node.
 
 ### Theme
 
-- Forced light theme explicitly (`follow_system_theme: false`, `default_theme: Theme::Light`)
-    → Now via `cc.egui_ctx.set_theme(egui::Theme::Light)` (eframe 0.35)
+- Forced light theme (`cc.egui_ctx.set_theme(egui::Theme::Light)`)
 - Selection text: `Color32::from_rgb(0, 150, 0)` (dark green)
 - Hover text: `Color32::RED`
 - Image selection overlay: green stroke, hover overlay: red stroke
@@ -176,6 +177,21 @@ buttons are disabled while `capturing`.
 - Timeout: previous temps restored; zombie thread self-cleans via SendError once its adb returns; `in_flight_*` covers exit-time cleanup
 - User load: `load_screenshot`/`load_xml` remove the tracked temp only after the new file loads successfully (a failed load keeps the current screenshot/XML usable)
 
+### Device Refresh
+
+`refresh_devices()` is called at the start of every `ui()` frame but is rate-limited
+to once every 15 seconds (using `last_adb_check: Option<Instant>`). The adb calls
+(`adb devices` + 2× `dumpsys`) run on a **background thread** via `fetch_device_refresh`,
+and the result is applied off-thread by `poll_device_refresh`:
+- Each adb call is bounded by `adb_output_bounded` (3s `REFRESH_ADB_TIMEOUT`), so a wedged
+  adb can't leak a permanently hung thread; on `adb devices` timeout/failure the current
+  device list is kept instead of being cleared
+- A `refresh_rx` in flight blocks duplicate concurrent refreshes (manual 🔄 button is deduped too)
+- A `selected == result.selected` guard skips applying displays fetched for a stale device selection
+- A hung refresh is abandoned after `REFRESH_TIMEOUT` (15s) as a safety net: the receiver is
+  dropped so `refresh_rx` can't block future refreshes, and a status error is shown
+A manual 🔄 button in the toolbar resets `last_adb_check` to `None` and triggers an immediate refresh.
+
 ### Keep Monitor (Auto Capture)
 
 Toolbar checkbox + interval stepper (`-`/`+` buttons, 0.5s steps, clamped 0.5–60s; changes reschedule the next tick immediately). Checking it fires a capture **immediately** and disables the two capture buttons; unchecking (or any capture failure) calls `stop_keep_monitor()` which clears the schedule, probe state, and checkbox.
@@ -204,25 +220,13 @@ Device detection: `adb devices` → picks the first connected device. No hard-co
 ### Console Window Suppression
 On Windows, every `adb` subprocess spawn (e.g. `adb devices`, `adb shell`,
 `screencap`, `adb pull`) would flash a console window briefly because the parent
-process has no console (detached via `FreeConsole()`). All ADB invocations go
-through the `adb()` helper (`main.rs:75`) which sets `CREATE_NO_WINDOW` on Windows
-to suppress this.
+process has no console (detached via `FreeConsole()`). All 20+ `adb` invocations
+in the codebase go through the `adb()` helper (`main.rs:161`), which sets
+`CREATE_NO_WINDOW` on Windows to suppress this; on other platforms `adb()` is a
+no-op (identical to `Command::new("adb")`).
 
-### Device Refresh Caching
-`refresh_devices()` is called at the start of every `ui()` frame but is rate-limited
-to once every 15 seconds (using `last_adb_check: Option<Instant>`). The adb calls
-(`adb devices` + 2× `dumpsys`) run on a **background thread** via `fetch_device_refresh`,
-and the result is applied off-thread by `poll_device_refresh`:
-- Each adb call is bounded by `adb_output_bounded` (4s `REFRESH_ADB_TIMEOUT`), so a wedged
-  adb can't leak a permanently hung thread; on `adb devices` timeout/failure the current
-  device list is kept instead of being cleared
-- A `refresh_rx` in flight blocks duplicate concurrent refreshes (manual 🔄 button is deduped too)
-- A `selected == result.selected` guard skips applying displays fetched for a stale device selection
-- A hung refresh is abandoned after `REFRESH_TIMEOUT` (15s) as a safety net: the receiver is
-  dropped so `refresh_rx` can't block future refreshes, and a status error is shown
-A manual 🔄 button in the toolbar resets `last_adb_check` to `None` and triggers an immediate refresh.
-
-### ADB calls
-All 20+ `Command::new("adb")` calls in the codebase have been replaced with `adb()`,
-ensuring consistent `CREATE_NO_WINDOW` behavior across the entire app on Windows.
-On non-Windows platforms, `adb()` is a no-op (identical to `Command::new("adb")`).
+### Logging
+The `log!` macro (`main.rs:69`) writes to stderr and appends to `<cwd>/uiviewer.log`
+(`uiviewer_log_path`, `main.rs:38`), capped at `LOG_MAX_BYTES` (10MB) by truncate-and-reuse.
+Shared behind `LOG_MUTEX` so concurrent background-thread calls append atomically;
+best-effort, never panics on write failure.

@@ -18,12 +18,18 @@ Built with [egui](https://github.com/emilk/egui) (immediate-mode GUI).
   **属性检查** — 查看 class、text、resource-id、content-desc 及所有 XML 属性
 - **ADB capture** — one-click screenshot + uiautomator dump from a connected device  
   **ADB 捕获** — 一键截屏 + uiautomator dump
-- **U2 capture** — capture via uiautomator2 (u2.jar JSON-RPC)  
-  **U2 捕获** — 通过 uiautomator2（u2.jar JSON-RPC）捕获
+- **U2 capture** — capture via uiautomator2 (u2.jar JSON-RPC); warm server reuse across captures  
+  **U2 捕获** — 通过 uiautomator2（u2.jar JSON-RPC）捕获；服务端在多次捕获间保持常驻复用
 - **Double-click tap** — double-click on image to send `input tap` and auto-refresh  
   **双击触控** — 双击图片发送 `input tap` 并自动刷新
 - **Drag swipe** — drag on image to send `input swipe` and auto-refresh (10px threshold)  
   **拖拽滑动** — 拖拽图片发送 `input swipe` 并自动刷新（10px 阈值）
+- **Keep monitor** — auto-capture at a fixed interval (0.5–60s), change-detection via a cheap hierarchy probe  
+  **持续监控** — 按固定间隔（0.5–60s）自动捕获，通过轻量层级探测做变更检测
+- **XPath display** — shows the XPath of the hovered/selected element in the Properties panel  
+  **XPath 显示** — 在属性面板显示悬停/选中元素的 XPath
+- **Export Icon** — crop the selected element from the screenshot and save as PNG  
+  **导出图标** — 从截图中裁剪选中元素并保存为 PNG
 - **Multi-display** — automatic detection of physical/logical display IDs  
   **多显示设备** — 自动检测物理/逻辑显示 ID
 - **Manual load** — load existing screenshot + XML pair from filesystem (auto-pairs)  
@@ -59,14 +65,18 @@ cargo run
    工具栏选择器设置捕获显示；属性面板选择器过滤树状视图
 5. **Inspect / 检查** — hover to highlight; click to select (same spot cycles ancestors)  
    悬停高亮，单击选中（同位置循环遍历祖先）
-6. **Interact / 交互** — double-click to tap; drag to swipe; auto-refresh after 800ms  
-   双击触控，拖拽滑动，800ms 后自动刷新
+6. **Interact / 交互** — double-click to tap; drag to swipe; auto-refresh after 1s (settle delay)  
+   双击触控，拖拽滑动，1 秒（settle delay）后自动刷新
 7. **Browse tree / 浏览树** — click arrows to expand/collapse; click labels to select; auto-scrolls to selected  
    点击箭头展开/折叠，点击标签选中，自动滚动到选中节点
-8. **Properties / 属性** — view selected element's attributes in the right panel  
-   在右侧面板查看选中元素的属性
-9. **Save / 保存** — click `Save` to export the current screenshot + XML pair  
-   点击 `Save` 导出当前截图 + XML 对
+8. **Properties / 属性** — view selected element's attributes and XPath in the right panel  
+   在右侧面板查看选中元素的属性和 XPath
+9. **Export Icon / 导出图标** — with an element selected, click `✂️ Export Icon` in the Properties panel to crop it from the screenshot  
+   选中元素后，点击属性面板中的 `✂️ Export Icon` 从截图裁剪该元素
+10. **Keep monitor / 持续监控** — tick `Keep monitor` in the toolbar to auto-capture at a fixed interval; `-`/`+` adjust the interval  
+    勾选工具栏中的 `Keep monitor` 按固定间隔自动捕获；`-`/`+` 调整间隔
+11. **Save / 保存** — click `Save` to export the current screenshot + XML pair  
+    点击 `Save` 导出当前截图 + XML 对
 
 The app also works completely offline with pre-captured files — no device needed for browsing and inspection.  
 该应用也支持完全离线使用预捕获的文件——浏览和检查无需连接设备。
@@ -78,6 +88,7 @@ The app also works completely offline with pre-captured files — no device need
 - [image](https://github.com/image-rs/image) — image loading (PNG, JPEG) / 图片加载
 - [rfd](https://github.com/PolyMeilex/rfd) — native file dialogs / 原生文件对话框
 - [serde_json](https://github.com/serde-rs/json) — JSON-RPC response parsing / JSON-RPC 响应解析
+- [base64](https://github.com/marshallpierce/rust-base64) — u2 screenshot base64 decoding / u2 截图 base64 解码
 
 ## Requirements / 要求
 
@@ -89,31 +100,3 @@ The app also works completely offline with pre-captured files — no device need
 
 > **Note / 注意**: Multi-display support is code-complete but has not been tested on actual multi-display devices.
 > 多显示设备支持已实现但未在实际多显示设备上测试。
-
----
-
-This repository's code was entirely written by **DeepSeek V4 Flash** in about 8 hours.
-If the UI tree parsing has issues or other bugs occur, provide the UI tree file and
-bug description to an AI to fix it.
-
-此仓库代码由 **DeepSeek V4 Flash** 在约 8 小时内完成。如果 UI 树解析有问题或其他 bug，请提供 UI 树文件和 bug 描述给 AI 修复。
-
----
-
-## Windows Notes / Windows 注意事项
-
-**Console window suppression / 控制台窗口抑制:**  
-On Windows, every ADB subprocess (e.g. `adb devices`, `screencap`, `pull`) previously flashed a console window. All ADB invocations now use a `CREATE_NO_WINDOW` flag via the `adb()` helper to suppress this.  
-在 Windows 上，每次执行 ADB 子进程（如 `adb devices`、`screencap`、`pull`）原本会闪烁一个控制台窗口。现在所有 ADB 调用都通过 `adb()` 辅助函数，带有 `CREATE_NO_WINDOW` 标志来抑制此现象。
-
-**Device refresh / 设备刷新:**  
-The toolbar's 🔄 button forces a refresh of the device list and display IDs. The list also auto-refreshes every 15 seconds while the app is running. Refreshes run on a background thread, so the UI never blocks while querying adb. A refresh that hangs is abandoned after 15 seconds (`REFRESH_TIMEOUT`) so the device list can't stay permanently frozen.  
-工具栏的 🔄 按钮可强制刷新设备列表和显示 ID。列表在运行期间也会每 15 秒自动刷新一次。刷新在后台线程执行，查询 adb 时 UI 不会卡顿。挂起的刷新会在 15 秒（`REFRESH_TIMEOUT`）后被放弃，设备列表不会永久卡死。
-
-**Background capture / 后台捕获:**  
-Captures (ADB/U2) run on a background thread, keeping the UI responsive. A capture that hangs is abandoned after 30 seconds (`CAPTURE_TIMEOUT`) and the previous view is restored.  
-捕获（ADB/U2）在后台线程执行，UI 保持响应。挂起的捕获会在 30 秒（`CAPTURE_TIMEOUT`）后被放弃并恢复之前的视图。
-
-**Rust version / Rust 版本:**  
-Requires Rust **1.92+** (MSRV dictated by eframe 0.35).  
-需要 Rust **1.92 及以上**（MSRV 由 eframe 0.35 决定）。
