@@ -1880,17 +1880,6 @@ impl App {
         }
     }
 
-    // True when any crop coordinate field holds text (even if not fully valid),
-    // so the Export Icon button stays available for coordinate-based cropping
-    // without a tree selection. Trimmed so whitespace-only input isn't treated
-    // as a coordinate (crop_coord_rect would parse it as None anyway).
-    fn has_crop_input(&self) -> bool {
-        !(self.crop_x1.trim().is_empty()
-            && self.crop_y1.trim().is_empty()
-            && self.crop_x2.trim().is_empty()
-            && self.crop_y2.trim().is_empty())
-    }
-
     // Parse the crop TL/BR inputs into a pixel Rect. Returns Some only when
     // every field parses as a number (corner order is normalized), None when
     // any field is empty/invalid — callers then fall back to the selected
@@ -2677,6 +2666,10 @@ impl eframe::App for App {
                         .on_hover_text(path.display().to_string());
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Live pointer position while hovering over the image.
+                    if let Some(p) = self.last_hover_img_pos {
+                        ui.label(format!("Pos: ({:.0}, {:.0})", p.x, p.y));
+                    }
                     if let Some(p) = self.click_pos {
                         ui.label(format!("Click: ({:.0}, {:.0})", p.x, p.y));
                     }
@@ -2766,10 +2759,9 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading("Properties");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.screenshot_path.is_some()
-                        && (self.selected_path.is_some() || self.has_crop_input())
-                        && ui.button("✂️ Export Icon").clicked()
-                    {
+                    // Always shown once a screenshot is loaded: with no tree (XML
+                    // not loaded) the button still enables coordinate-based export.
+                    if self.screenshot_path.is_some() && ui.button("✂️ Export Icon").clicked() {
                         export_requested = true;
                     }
                 });
@@ -3305,25 +3297,7 @@ mod tests {
         app.crop_x2 = "abc".into();
         app.crop_y2 = "80".into();
         assert_eq!(app.crop_coord_rect(), None);
-        assert!(app.has_crop_input());
         app.clear_crop_coords();
         assert_eq!(app.crop_coord_rect(), None);
-        assert!(!app.has_crop_input());
-    }
-
-    #[test]
-    fn has_crop_input_true_when_any_field_filled() {
-        let mut app = App::default();
-        assert!(!app.has_crop_input());
-        app.crop_x2 = "50".into();
-        assert!(app.has_crop_input());
-    }
-
-    #[test]
-    fn has_crop_input_ignores_whitespace_only() {
-        let mut app = App::default();
-        app.crop_x1 = "  ".into();
-        app.crop_y1 = "\t".into();
-        assert!(!app.has_crop_input());
     }
 }
