@@ -32,11 +32,21 @@ fn next_temp_id() -> u64 {
     TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-// Log file path: <current working dir>/uiviewer.log. The app detaches from the
-// console (FreeConsole) on Windows, so eprintln goes nowhere there; a file log
-// next to the executable keeps the [uiviewer] diagnostics observable.
+// Log file path: <startup working dir>/uiviewer.log. Resolved once, lazily at
+// the first log call, so a later chdir() from a file dialog can't redirect the
+// log to a different directory. The app detaches from the console (FreeConsole)
+// on Windows, so eprintln goes nowhere there; a file log in the launch
+// directory keeps the [uiviewer] diagnostics observable.
+static LOG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 fn uiviewer_log_path() -> PathBuf {
-    PathBuf::from("uiviewer.log")
+    LOG_PATH
+        .get_or_init(|| {
+            std::env::current_dir()
+                .map(|dir| dir.join("uiviewer.log"))
+                .unwrap_or_else(|_| PathBuf::from("uiviewer.log"))
+        })
+        .clone()
 }
 
 // Fixed cap for the log file: once exceeded the file is truncated and reuse

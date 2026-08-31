@@ -200,7 +200,7 @@ Toolbar checkbox + interval stepper (`-`/`+` buttons, 0.5s steps, clamped 0.5–
 - **Scheduling**: next tick is scheduled from each capture *completion* (`poll_capture` Ok arm) — natural backpressure when a capture outlasts the interval.
 - **Wake-ups (event-driven)**: the capture thread and the U2 probe thread both call `ctx.request_repaint()` once their result is ready; an idle wait between ticks arms a single precise `request_repaint_after(next_auto_capture - now)` wake-up instead. No heartbeat or polling keeps the UI awake, so monitoring costs zero repaints while idle — even a probe whose result is "unchanged" triggers exactly one repaint to be handled.
 - **Two-tier change detection (U2 method only)**: each tick first runs an off-thread hierarchy-only RPC probe (`probe_u2_hierarchy_hash`, result hashed with FNV-1a). Full capture fires only when the hash changed, every `MONITOR_FORCE_REFRESH_EVERY` unchanged probes (eventual consistency for pixel-only changes like video), or when the probe fails (then the real capture surfaces the error or recovers). ADB method always captures fully (its probe would cost the same JVM spawn).
-- **Tree panel**: monitor-driven captures never retarget `tree_display_id` (`capture_source_auto` flag distinguishes them from user-driven ones); successful captures made while monitoring refresh the baseline hash from the fresh dump.
+- **Tree panel**: captures (user- and monitor-driven alike) all go through `load_captured_pair`, which retargets `tree_display_id` only when the dump lacks the current display (fallback to `file_displays[0]`); successful captures made while monitoring refresh the baseline hash from the fresh dump.
 
 ## Common Commands
 
@@ -226,7 +226,8 @@ in the codebase go through the `adb()` helper (`main.rs:161`), which sets
 no-op (identical to `Command::new("adb")`).
 
 ### Logging
-The `log!` macro (`main.rs:69`) writes to stderr and appends to `<cwd>/uiviewer.log`
-(`uiviewer_log_path`, `main.rs:38`), capped at `LOG_MAX_BYTES` (10MB) by truncate-and-reuse.
+The `log!` macro (`main.rs:79`) writes to stderr and appends to `<startup cwd>/uiviewer.log`
+(`uiviewer_log_path`, `main.rs:42`), the path resolved once into a `OnceLock` so file-dialog
+`chdir` calls can't move it. Capped at `LOG_MAX_BYTES` (10MB) by truncate-and-reuse.
 Shared behind `LOG_MUTEX` so concurrent background-thread calls append atomically;
 best-effort, never panics on write failure.
