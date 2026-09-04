@@ -402,6 +402,11 @@ struct App {
     crop_y1: String,
     crop_x2: String,
     crop_y2: String,
+    // Decoded RGBA pixels of the current screenshot, kept so a click can read
+    // the RGB color at the clicked pixel without re-decoding the image file.
+    screenshot_rgba: Option<image::RgbaImage>,
+    // RGB color sampled at the last image click, displayed in the status bar.
+    click_rgb: Option<(u8, u8, u8)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -485,6 +490,8 @@ impl Default for App {
             crop_y1: String::new(),
             crop_x2: String::new(),
             crop_y2: String::new(),
+            screenshot_rgba: None,
+            click_rgb: None,
         }
     }
 }
@@ -661,7 +668,7 @@ fn parse_windows_xml(text: &str, display_id: u32) -> Option<UiNode> {
     merge_nodes(nodes)
 }
 
-fn load_texture(path: &Path, ctx: &egui::Context) -> Result<(TextureHandle, Vec2), String> {
+fn load_texture(path: &Path, ctx: &egui::Context) -> Result<(TextureHandle, Vec2, image::RgbaImage), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open image: {e}"))?;
     let img = image::ImageReader::new(std::io::BufReader::new(file))
         .with_guessed_format()
@@ -675,7 +682,7 @@ fn load_texture(path: &Path, ctx: &egui::Context) -> Result<(TextureHandle, Vec2
         rgba.as_raw(),
     );
     let tex = ctx.load_texture("screenshot", color_image, TextureOptions::default());
-    Ok((tex, size))
+    Ok((tex, size, rgba))
 }
 
 // Default file name for an exported element icon: the resource-id's last
@@ -1696,7 +1703,7 @@ impl App {
             None => {
                 // No companion: load the screenshot alone, keeping the current tree.
                 match load_texture(path, ctx) {
-                    Ok((tex, _size)) => {
+                    Ok((tex, _size, rgba)) => {
                         // Only discard the previous capture's temp file once the
                         // new image actually loaded, so a failed load keeps the
                         // current screenshot usable.
@@ -1704,6 +1711,7 @@ impl App {
                             let _ = std::fs::remove_file(&p);
                         }
                         self.screenshot_texture = Some(tex);
+                        self.screenshot_rgba = Some(rgba);
                         self.screenshot_path = Some(path.to_path_buf());
                         true
                     }
@@ -1780,8 +1788,8 @@ impl App {
     // either file is invalid, so a failure never shows a mismatched pair and
     // the previous UI state stays fully intact.
     fn load_captured_pair(&mut self, png: &Path, xml: &Path, ctx: &egui::Context) -> bool {
-        let tex = match load_texture(png, ctx) {
-            Ok((tex, _size)) => tex,
+        let (tex, rgba) = match load_texture(png, ctx) {
+            Ok((tex, _size, rgba)) => (tex, rgba),
             Err(e) => {
                 log!("[uiviewer] load_captured_pair: decode screenshot failed: {e}");
                 return false;
@@ -1810,6 +1818,7 @@ impl App {
             let _ = std::fs::remove_file(&p);
         }
         self.screenshot_texture = Some(tex);
+        self.screenshot_rgba = Some(rgba);
         self.screenshot_path = Some(png.to_path_buf());
         if let Some(p) = self.temp_xml.take() {
             let _ = std::fs::remove_file(&p);
@@ -2671,7 +2680,13 @@ impl eframe::App for App {
                         ui.label(format!("Pos: ({:.0}, {:.0})", p.x, p.y));
                     }
                     if let Some(p) = self.click_pos {
-                        ui.label(format!("Click: ({:.0}, {:.0})", p.x, p.y));
+                        match self.click_rgb {
+                            Some((r, g, b)) => ui.label(format!(
+                                "Click: ({:.0}, {:.0})  RGB({r}, {g}, {b})",
+                                p.x, p.y
+                            )),
+                            None => ui.label(format!("Click: ({:.0}, {:.0})", p.x, p.y)),
+                        };
                     }
                 });
             });
@@ -3005,6 +3020,19 @@ impl eframe::App for App {
                             self.scroll_to_target = self.hovered_path.clone();
                         }
                         self.click_pos = Some(img_pos);
+                        self.click_rgb = self.screenshot_rgba.as_ref().and_then(|rgba| {
+                            let (x, y) = (img_pos.x.floor() as i64, img_pos.y.floor() as i64);
+                            if x >= 0
+                                && y >= 0
+                                && x < rgba.width() as i64
+                                && y < rgba.height() as i64
+                            {
+                                let p = rgba.get_pixel(x as u32, y as u32);
+                                Some((p[0], p[1], p[2]))
+                            } else {
+                                None
+                            }
+                        });
                     }
                     if response.double_clicked() && self.selected_device.is_some() {
                         self.pending_tap = Some((img_pos.x, img_pos.y));
