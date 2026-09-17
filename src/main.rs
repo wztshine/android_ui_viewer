@@ -809,19 +809,18 @@ fn build_xpath_str(preds: &[(&str, &str)]) -> String {
     s
 }
 
-// Generate a unique page-level XPath for `node` within `root`. text and
-// resource-id are prioritized (in that order), followed by content-desc and
-// class combinations; state predicates (checked/selected) are appended only
-// when the plain attribute combinations are not unique, mirroring the
-// `[@selected='true']` / `[@checked='false']` style. Returns None when no
-// candidate matches exactly one node — callers leave the value empty.
-fn generate_xpath(node: &UiNode, root: &UiNode) -> Option<String> {
+// Ordered attribute-combination candidates for `node`, most preferred first.
+// text and resource-id are prioritized (in that order), followed by
+// content-desc and class combinations; state predicates (checked/selected)
+// are appended only as disambiguators, mirroring the `[@selected='true']` /
+// `[@checked='false']` style. Every candidate is guaranteed to match `node`
+// itself.
+fn predicate_candidates(node: &UiNode) -> Vec<Vec<(&str, &str)>> {
     let t = node_attr(node, "text");
     let r = node_attr(node, "resource-id");
     let d = node_attr(node, "content-desc");
     let c = node_attr(node, "class");
 
-    // State predicates used as a last-resort disambiguator.
     let mut state: Vec<(&str, &str)> = Vec::new();
     for k in ["checked", "selected"] {
         if let Some(v) = node_attr(node, k) {
@@ -829,9 +828,6 @@ fn generate_xpath(node: &UiNode, root: &UiNode) -> Option<String> {
         }
     }
 
-    // Identity-attribute candidates, most preferred first. Every candidate is
-    // guaranteed to match `node` itself, so the walk always finds >= 1 match;
-    // non-unique candidates short-circuit at 2.
     let mut base: Vec<Vec<(&str, &str)>> = Vec::new();
     if let Some(t) = t {
         base.push(vec![("text", t)]);
@@ -858,29 +854,183 @@ fn generate_xpath(node: &UiNode, root: &UiNode) -> Option<String> {
         base.push(vec![("class", c), ("resource-id", r), ("content-desc", d)]);
     }
 
-    for preds in &base {
-        if count_matches(root, preds) == 1 {
-            return Some(build_xpath_str(preds));
-        }
-    }
-    // State predicates as a last resort (e.g. identical rows/checkboxes).
+    let mut all = base.clone();
     if !state.is_empty() {
-        for preds in &base {
-            let mut extended = preds.clone();
+        for p in &base {
+            let mut extended = p.clone();
             extended.extend(state.iter().copied());
-            if count_matches(root, &extended) == 1 {
-                return Some(build_xpath_str(&extended));
-            }
+            all.push(extended);
         }
         if let Some(c) = c {
             let mut cand = vec![("class", c)];
             cand.extend(state.iter().copied());
-            if count_matches(root, &cand) == 1 {
-                return Some(build_xpath_str(&cand));
+            all.push(cand);
+        }
+    }
+    all
+}
+
+// Render the predicate portion of an XPath, `[@a='v'][@b='w']` (no leading
+// `*`), so it can be appended to an axis step like `preceding-sibling::*`.
+fn predicates_str(preds: &[(&str, &str)]) -> String {
+    let mut s = String::new();
+    for (k, v) in preds {
+        use std::fmt::Write;
+        write!(s, "[@{k}={}]", xpath_literal(v)).ok();
+    }
+    s
+}
+
+// First predicate candidate that matches `node` and is unique among `parent`'s
+// direct children, so an axis-scoped lookup lands exactly on `node`.
+fn direct_unique_predicates<'a>(
+    node: &'a UiNode,
+    parent: &UiNode,
+) -> Option<Vec<(&'a str, &'a str)>> {
+    for preds in predicate_candidates(node) {
+        if node_matches_attrs(node, &preds)
+            && parent
+                .children
+                .iter()
+                .filter(|c| node_matches_attrs(c, &preds))
+                .count()
+                == 1
+        {
+            return Some(preds);
+        }
+    }
+    None
+}
+
+// Find, in the subtree of `parent.children[branch_idx]`, a node whose `text`
+// is unique across the whole tree. Returns its text and its depth under
+// `parent` (1 = the branch node itself). Prefers the shallowest anchor.
+fn unique_text_anchor(
+    root: &UiNode,
+    parent: &UiNode,
+    branch_idx: usize,
+) -> Option<(String, usize)> {
+    fn walk(
+        root: &UiNode,
+        node: &UiNode,
+        depth: usize,
+        best: &mut Option<(String, usize)>,
+    ) {
+        if let Some(t) = node_attr(node, "text") {
+            if count_matches(root, &[("text", t)]) == 1
+                && best.as_ref().map_or(true, |(_, d)| depth < *d)
+            {
+                *best = Some((t.to_string(), depth));
+            }
+        }
+        for c in &node.children {
+            walk(root, c, depth + 1, best);
+        }
+    }
+    let mut best: Option<(String, usize)> = None;
+    walk(root, &parent.children[branch_idx], 1, &mut best);
+    best
+}
+
+// Neighbour-anchor XPath: when `node`'s own attributes repeat across the tree,
+// reach it from a nearby text-unique sibling branch. Same-level anchors use the
+// sibling axes (`//*[@text='x']/preceding-sibling::*[@id='y'][1]`), deeper
+// anchors climb with `parent::*` and re-select among the parent's children
+// (`//*[@text='x']/parent::*/parent::*/*[@id='y'][1]`) — both hand-written
+// styles users rely on. Content text anchors survive list scrolling, unlike
+// position-only paths.
+fn anchor_xpath(node: &UiNode, root: &UiNode, path: &[usize]) -> Option<String> {
+    let n = path.len();
+    if n == 0 {
+        return None;
+    }
+    let parent = root.node_at(&path[..n - 1])?;
+    let node_idx = path[n - 1];
+    let preds = direct_unique_predicates(node, parent)?;
+    let target = predicates_str(&preds);
+    for (i, _) in parent.children.iter().enumerate() {
+        if i == node_idx {
+            continue;
+        }
+        if let Some((text, depth)) = unique_text_anchor(root, parent, i) {
+            let anchor = format!("//*[@text={}]", xpath_literal(&text));
+            if depth == 1 {
+                // Same-level: sibling axes. `[1]` selects the matching sibling
+                // closest to the anchor, so no other matching sibling may sit
+                // between anchor and node.
+                let axis = if i < node_idx {
+                    "following-sibling"
+                } else {
+                    "preceding-sibling"
+                };
+                let (lo, hi) = if i < node_idx {
+                    (i + 1, node_idx)
+                } else {
+                    (node_idx + 1, i)
+                };
+                let between = parent.children[lo..hi]
+                    .iter()
+                    .any(|c| node_matches_attrs(c, &preds));
+                if !between {
+                    return Some(format!("{anchor}/{axis}::*{target}[1]"));
+                }
+            } else {
+                // Cross-level: climb `depth` parents, then re-select among the
+                // parent's children (whose attributes are unique there).
+                let ups = "parent::*/".repeat(depth);
+                return Some(format!("{anchor}/{ups}*{target}[1]"));
             }
         }
     }
     None
+}
+
+// Last-resort position path: `/*[1]/*[@class='x'][n]/...` walks from the
+// document root's first child down the tree, each level selecting by class
+// attribute plus its 1-based occurrence among same-class siblings (or `*[n]`
+// when class is absent). Always unique for the current dump, but it is a slot,
+// not content — RecyclerView/ListView reuse view holders, so after a scroll
+// the slot may hold a different element.
+fn absolute_path_xpath(root: &UiNode, path: &[usize]) -> String {
+    // Assume `root` is the first child of the document root (hierarchy node).
+    let mut s = String::from("/*[1]");
+    let mut parent = root;
+    for &idx in path {
+        let node = &parent.children[idx];
+        if let Some(c) = node_attr(node, "class") {
+            let n = parent.children[..=idx]
+                .iter()
+                .filter(|sib| node_attr(sib, "class") == Some(c))
+                .count();
+            use std::fmt::Write;
+            write!(s, "/*[@class={}][{n}]", xpath_literal(c)).ok();
+        } else {
+            use std::fmt::Write;
+            write!(s, "/*[{}]", idx + 1).ok();
+        }
+        parent = node;
+    }
+    s
+}
+
+// Generate a unique XPath for `node` (at `path` under `root`). Tries, in
+// order: attribute combinations unique across the whole tree; a text-anchored
+// sibling/parent-axis path; finally an absolute position path. Never returns
+// None — the root node itself resolves to `/*[1]` (its slot under the
+// document root).
+fn generate_xpath(node: &UiNode, root: &UiNode, path: &[usize]) -> Option<String> {
+    for preds in predicate_candidates(node) {
+        if count_matches(root, &preds) == 1 {
+            return Some(build_xpath_str(&preds));
+        }
+    }
+    if let Some(xp) = anchor_xpath(node, root, path) {
+        return Some(xp);
+    }
+    if path.is_empty() {
+        return Some("/*[1]".to_string());
+    }
+    Some(absolute_path_xpath(root, path))
 }
 
 fn get_display_ids_from_xml(text: &str) -> Vec<u32> {
@@ -2837,7 +2987,8 @@ impl eframe::App for App {
                         Some(xp) => xp,
                         None => {
                             let val = self.root_node.as_ref().and_then(|r| {
-                                r.node_at(&displayed).and_then(|n| generate_xpath(n, r))
+                                r.node_at(&displayed)
+                                    .and_then(|n| generate_xpath(n, r, &displayed))
                             });
                             self.xpath_cache =
                                 Some((self.tree_revision, displayed, val.clone()));
@@ -3186,7 +3337,7 @@ mod tests {
     #[test]
     fn unique_text_yields_text_xpath() {
         let n = node(&[("class", "android.widget.TextView"), ("text", "设置")]);
-        let xp = generate_xpath(&n, &n).unwrap();
+        let xp = generate_xpath(&n, &n, &[]).unwrap();
         assert_eq!(xp, "//*[@text='设置']");
     }
 
@@ -3204,7 +3355,7 @@ mod tests {
         ]);
         let root = root_with(vec![target.clone(), other]);
         assert_eq!(
-            generate_xpath(&target, &root).unwrap(),
+            generate_xpath(&target, &root, &[0]).unwrap(),
             "//*[@resource-id='com.x:id/title1']"
         );
     }
@@ -3223,16 +3374,72 @@ mod tests {
         ]);
         let root = root_with(vec![on, off.clone()]);
         assert_eq!(
-            generate_xpath(&off, &root).unwrap(),
+            generate_xpath(&off, &root, &[1]).unwrap(),
             "//*[@text='允许'][@checked='false']"
         );
     }
 
     #[test]
-    fn not_unique_yields_none() {
+    fn duplicate_falls_back_to_position_path() {
         let dup = node(&[("class", "android.widget.TextView"), ("text", "设置")]);
         let root = root_with(vec![dup.clone(), dup]);
-        assert_eq!(generate_xpath(&root.children[0], &root), None);
+        assert_eq!(
+            generate_xpath(&root.children[0], &root, &[0]),
+            Some("/*[1]/*[@class='android.widget.TextView'][1]".to_string())
+        );
+    }
+
+    #[test]
+    fn root_node_falls_back_to_first_child() {
+        let root = root_with(vec![node(&[("class", "android.widget.TextView")])]);
+        assert_eq!(generate_xpath(&root, &root, &[]), Some("/*[1]".to_string()));
+    }
+
+    #[test]
+    fn sibling_text_anchor_preceding_sibling() {
+        // The hand-written style: unique sibling text anchors a repeated-id
+        // target on the same row.
+        let icon = node(&[
+            ("class", "android.widget.ImageView"),
+            ("resource-id", "com.example:id/app_icon"),
+        ]);
+        let label = node(&[("class", "android.widget.TextView"), ("text", "Settings")]);
+        // Two rows share the icon id; only the target row has the label.
+        let row_target = root_with(vec![icon.clone(), label.clone()]);
+        let row_other = root_with(vec![icon.clone()]);
+        let root = root_with(vec![row_target, row_other]);
+        // target icon is row_target.children[0]; label is its next sibling.
+        assert_eq!(
+            generate_xpath(&root.children[0].children[0], &root, &[0, 0]),
+            Some(
+                "//*[@text='Settings']/preceding-sibling::*[@resource-id='com.example:id/app_icon'][1]"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn cross_level_parent_axis_anchor() {
+        // The hand-written style: climb two parents from the text anchor, then
+        // re-select the target inside that container.
+        let sw = node(&[
+            ("class", "android.widget.Switch"),
+            ("resource-id", "com.example:id/switch"),
+        ]);
+        let text = node(&[("class", "android.widget.TextView"), ("text", "Mobile data")]);
+        // Two containers both hold a switch; only the target one has the
+        // "Mobile data" label nested two levels up.
+        let container_target = root_with(vec![root_with(vec![text.clone()]), sw.clone()]);
+        let container_other = root_with(vec![sw.clone()]);
+        let root = root_with(vec![container_target, container_other]);
+        // target sw path: [0,1]; label path [0,0,0].
+        assert_eq!(
+            generate_xpath(&root.children[0].children[1], &root, &[0, 1]),
+            Some(
+                "//*[@text='Mobile data']/parent::*/parent::*/*[@resource-id='com.example:id/switch'][1]"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -3272,21 +3479,21 @@ mod tests {
     #[test]
     fn newline_in_text_is_faithfully_included() {
         let n = node(&[("class", "android.widget.TextView"), ("text", "line1\nline2")]);
-        let xp = generate_xpath(&n, &n).unwrap();
+        let xp = generate_xpath(&n, &n, &[]).unwrap();
         assert_eq!(xp, "//*[@text='line1\nline2']");
     }
 
     #[test]
     fn quote_in_text_uses_double_quote_delimiter() {
         let n = node(&[("class", "android.widget.TextView"), ("text", "it's")]);
-        assert_eq!(generate_xpath(&n, &n).unwrap(), "//*[@text=\"it's\"]");
+        assert_eq!(generate_xpath(&n, &n, &[]).unwrap(), "//*[@text=\"it's\"]");
     }
 
     #[test]
     fn mixed_quotes_use_concat() {
         let n = node(&[("class", "android.widget.TextView"), ("text", "a'b\"c")]);
         assert_eq!(
-            generate_xpath(&n, &n).unwrap(),
+            generate_xpath(&n, &n, &[]).unwrap(),
             "//*[@text=concat('a', \"'\", 'b\"c')]"
         );
     }
