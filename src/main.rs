@@ -3155,7 +3155,7 @@ impl eframe::App for App {
                         self.last_hover_img_pos = Some(img_pos);
                     }
 
-                    if response.clicked() {
+                    if response.clicked() && !response.double_clicked() {
                         let same_spot = self.click_pos.is_some_and(|last| (img_pos - last).length() < 10.0);
                         if same_spot {
                             if let Some(cur) = self.selected_path.clone() {
@@ -3185,8 +3185,12 @@ impl eframe::App for App {
                             }
                         });
                     }
-                    if response.double_clicked() && self.selected_device.is_some() {
-                        self.pending_tap = Some((img_pos.x, img_pos.y));
+                    if response.double_clicked() {
+                        self.click_pos = None;
+                        self.click_rgb = None;
+                        if self.selected_device.is_some() {
+                            self.pending_tap = Some((img_pos.x, img_pos.y));
+                        }
                     }
                 } else if !response.dragged() {
                     self.hovered_path = None;
